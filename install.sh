@@ -1,524 +1,987 @@
 #!/bin/sh
-# setup-sstp-tunnel-fixed-v3.sh
-# OpenWrt SSTP management tunnel installer.
-# Allows from SSTP zone only: SSH 22, HTTP 80, ICMP ping.
-# Optional: route from this router to LAN behind SSTP server for file download.
-# For OpenWrt 24.10.x forces sstp-client downgrade to 1.0.15-1
-# because sstp-client 1.0.20-r1 may pass a broken empty option to pppd.
+# openwrt-sstp-tunnel - management tunnel installer for OpenWrt.
+#
+# Builds an SSTP tunnel to a management server and opens, from that tunnel only,
+# SSH 22, HTTP 80 and ICMP echo to the router itself. Nothing else: no forwarding
+# into the client LAN, no default route, no DNS takeover.
+#
+# Why this ships its own netifd protocol handler (sstpm):
+# sstp-client stores the pppd command line in a fixed "const char *args[20]"
+# (src/sstp-pppd.c, sstp_pppd_start). Eleven slots plus the NULL terminator are
+# taken by sstpc itself (pppd, tty, speed, user+value, file+tmpfile,
+# plugin+name+sstp-sock+socket), so only 8 pppd arguments fit. The stock
+# /lib/netifd/proto/sstp.sh passes 13 even with defaultroute/peerdns/ipv6 off,
+# which overflows the array. In 1.0.20 the clobbered stack slot happens to be
+# the local "speed" buffer, which is why pppd dies with
+# "unrecognized option <garbage>"; in 1.0.15 the same overflow lands somewhere
+# harmless, which is the only reason that version "works".
+# See https://github.com/openwrt/packages/issues/27318 (still open).
+# Our handler keeps the permanent pppd options in a file and passes 4 arguments.
+# If the tunnel still fails with that signature and opkg is available, the
+# installer falls back to pinning sstp-client 1.0.15-1 from 23.05.6.
 
 set -u
 
-SCRIPT_NAME="$(basename "$0")"
+VERSION="2.0"
+
+# The protocol name is baked into the generated handler as well (netifd derives
+# proto_<name>_setup from it), so do not change it here alone.
+PROTO="sstpm"
+NET_SECTION="sstp"
+ZONE="sstp"
+
+PROTO_FILE="/lib/netifd/proto/${PROTO}.sh"
+PPP_OPTS_FILE="/etc/ppp/options.${PROTO}"
+HOTPLUG_FILE="/etc/hotplug.d/iface/95-sstp-tunnel"
 BACKUP_DIR="/root/sstp-backup"
-HOTPLUG_FILE="/etc/hotplug.d/iface/95-sstp-wan"
-SSTP_IF="sstp"
-FIXED_SSTP_VERSION="1.0.15-1"
-FIXED_OWRT_RELEASE="23.05.5"
+STATE_DIR="/tmp/sstp-install"
 
-ROUTE_SECTION="sstp_server_lan_route"
-FILE_RULE_SECTION="allow_router_to_server_file_over_sstp"
+PIN_VERSION="1.0.15-1"
+PIN_RELEASE="23.05.6"
 
-DEFAULT_SERVER_LAN_CIDR="192.168.65.0/24"
-DEFAULT_SERVER_FILE_IP="192.168.65.10"
-DEFAULT_SERVER_FILE_PORT="80"
+# Seconds the unattended rollback waits for the installer to confirm success.
+ROLLBACK_WAIT="600"
+# Seconds to wait for the tunnel to come up.
+UP_TIMEOUT="75"
+# KiB of available RAM required before letting opkg build its package lists.
+MIN_MEM_KB="20000"
+# KiB of free overlay space required for the package and config.
+MIN_OVERLAY_KB="400"
 
-log()  { echo "[INFO] $*"; }
-warn() { echo "[WARN] $*"; }
-err()  { echo "[ERROR] $*" >&2; }
+SCRIPT_NAME="$(basename "$0")"
+
+# Sections this script owns, plus leftovers from older versions that used to
+# route into the server-side LAN. Listed once, purged from install and remove.
+NET_SECTIONS="$NET_SECTION sstp_server_lan_route"
+FW_SECTIONS="$ZONE allow_ssh_from_sstp allow_http_from_sstp allow_ping_from_sstp
+	allow_https_from_sstp sstp_to_lan lan_to_sstp
+	allow_router_to_server_file_over_sstp"
+
+log()  { echo "[..] $*"; }
+ok()   { echo "[ok] $*"; }
+warn() { echo "[!!] $*" >&2; }
+err()  { echo "[EE] $*" >&2; }
 die()  { err "$*"; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
 cat <<USAGE
+openwrt-sstp-tunnel $VERSION
+
 Usage:
-  sh $SCRIPT_NAME install   Configure SSTP tunnel
-  sh $SCRIPT_NAME status    Show SSTP status and diagnostics
-  sh $SCRIPT_NAME remove    Remove SSTP tunnel config
+  sh $SCRIPT_NAME install   configure the management tunnel
+  sh $SCRIPT_NAME status    show state and diagnostics
+  sh $SCRIPT_NAME remove    remove the tunnel configuration
 
-The installer asks for:
-  - SSTP server hostname, for example: remout.crazedns.ru
-  - username
-  - password
-  - optional route to LAN behind SSTP server, default: 192.168.65.0/24
-  - optional file server IP/port, default: 192.168.65.10:80
+install asks for the SSTP server (host or host:port), username and password,
+then does everything else by itself: package, protocol handler, interface,
+firewall, autostart, bring-up and verification.
 
-Firewall policy from SSTP to this router is minimal:
-  - allow TCP 22
-  - allow TCP 80
-  - allow ICMP echo-request
-  - deny everything else
+Access granted from the tunnel to this router:
+  TCP 22, TCP 80, ICMP echo-request. Everything else is rejected.
 
-Optional file mode allows only router-originated TCP access to one server-side IP:port.
-It does NOT open client LAN and does NOT allow SSTP clients into LAN.
+While applying the configuration an unattended rollback is armed: if the
+installer does not confirm success within $ROLLBACK_WAIT seconds (lost session,
+broken config, unreachable router), /etc/config/network and /etc/config/firewall
+are restored from $BACKUP_DIR and the network is restarted.
 USAGE
 }
 
-need_root() {
-    [ "$(id -u)" = "0" ] || die "Run as root."
+# ---------------------------------------------------------------- environment
+
+require_root() {
+	[ "$(id -u)" = "0" ] || die "Run as root."
 }
 
-need_openwrt() {
-    [ -x /sbin/uci ] || die "uci not found. This script is for OpenWrt."
-    [ -x /bin/opkg ] || die "opkg not found. This script is for OpenWrt."
+detect_platform() {
+	[ -x /sbin/uci ] || die "uci not found. This script is for OpenWrt."
+	have ubus || die "ubus not found. This script is for OpenWrt."
+
+	# 25.12 and later ship apk, 23.05/24.10 ship opkg. Check apk first: some
+	# images keep an opkg shim around that cannot install anything.
+	if have apk && [ -d /lib/apk ]; then
+		PKG="apk"
+	elif have opkg; then
+		PKG="opkg"
+	else
+		die "Neither apk nor opkg found, cannot install packages."
+	fi
+
+	RELEASE="unknown"
+	[ -r /etc/os-release ] && RELEASE="$(. /etc/os-release 2>/dev/null && echo "${VERSION_ID:-unknown}")"
+
+	log "OpenWrt ${RELEASE}, package manager: ${PKG}"
 }
 
-backup_configs() {
-    TS="$(date +%F-%H%M%S)"
-    mkdir -p "$BACKUP_DIR" || die "Cannot create $BACKUP_DIR"
+check_resources() {
+	MEM_KB="$(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo 2>/dev/null)"
+	[ -n "${MEM_KB:-}" ] || MEM_KB="$(awk '/^MemFree:/ { print $2; exit }' /proc/meminfo 2>/dev/null)"
+	[ -n "${MEM_KB:-}" ] || MEM_KB="0"
 
-    [ -f /etc/config/network ] && cp /etc/config/network "$BACKUP_DIR/network.$TS.bak" || true
-    [ -f /etc/config/firewall ] && cp /etc/config/firewall "$BACKUP_DIR/firewall.$TS.bak" || true
+	OVERLAY_KB="$(df -k /overlay 2>/dev/null | awk 'NR==2 { print $4; exit }')"
+	[ -n "${OVERLAY_KB:-}" ] || OVERLAY_KB="$(df -k / 2>/dev/null | awk 'NR==2 { print $4; exit }')"
+	[ -n "${OVERLAY_KB:-}" ] || OVERLAY_KB="0"
 
-    log "Backups saved to $BACKUP_DIR"
+	log "Available RAM: ${MEM_KB} KiB, free overlay: ${OVERLAY_KB} KiB"
+	# The overlay requirement is only enforced when a package has to be
+	# installed, see install_package. Reconfiguring an existing install needs
+	# barely any space and must not fail on a tightly packed router.
 }
+
+# -------------------------------------------------------------------- prompts
 
 read_line() {
-    PROMPT="$1"
-    DEFAULT="${2:-}"
+	_prompt="$1"
+	_default="${2:-}"
 
-    if [ -n "$DEFAULT" ]; then
-        MSG="$PROMPT [$DEFAULT]: "
-    else
-        MSG="$PROMPT: "
-    fi
+	if [ -n "$_default" ]; then
+		_msg="$_prompt [$_default]: "
+	else
+		_msg="$_prompt: "
+	fi
 
-    if [ -r /dev/tty ]; then
-        printf "%s" "$MSG" > /dev/tty
-        IFS= read -r VALUE < /dev/tty
-    else
-        printf "%s" "$MSG" >&2
-        IFS= read -r VALUE
-    fi
+	# The installer is usually piped into sh, so ask on the terminal directly.
+	if [ -r /dev/tty ]; then
+		printf "%s" "$_msg" > /dev/tty
+		IFS= read -r _value < /dev/tty
+	else
+		printf "%s" "$_msg" >&2
+		IFS= read -r _value
+	fi
 
-    [ -n "$VALUE" ] || VALUE="$DEFAULT"
-    printf "%s" "$VALUE"
+	[ -n "$_value" ] || _value="$_default"
+	printf "%s" "$_value"
 }
 
 read_secret() {
-    PROMPT="$1"
+	_prompt="$1"
 
-    if [ -r /dev/tty ]; then
-        printf "%s" "$PROMPT" > /dev/tty
-        stty -echo < /dev/tty 2>/dev/null || true
-        IFS= read -r VALUE < /dev/tty
-        stty echo < /dev/tty 2>/dev/null || true
-        printf "\n" > /dev/tty
-    else
-        printf "%s" "$PROMPT" >&2
-        stty -echo 2>/dev/null || true
-        IFS= read -r VALUE
-        stty echo 2>/dev/null || true
-        printf "\n" >&2
-    fi
+	if [ -r /dev/tty ]; then
+		printf "%s" "$_prompt" > /dev/tty
+		stty -echo < /dev/tty 2>/dev/null || true
+		IFS= read -r _value < /dev/tty
+		stty echo < /dev/tty 2>/dev/null || true
+		printf "\n" > /dev/tty
+	else
+		printf "%s" "$_prompt" >&2
+		stty -echo 2>/dev/null || true
+		IFS= read -r _value
+		stty echo 2>/dev/null || true
+		printf "\n" >&2
+	fi
 
-    printf "%s" "$VALUE"
+	printf "%s" "$_value"
 }
 
 trim() {
-    # Trim leading/trailing spaces and tabs. BusyBox-compatible.
-    printf "%s" "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
-}
-
-sanitize_server() {
-    S="$(trim "$1")"
-    S="${S#http://}"
-    S="${S#https://}"
-    S="${S%%/*}"
-    S="${S%%:*}"
-    printf "%s" "$S"
+	printf "%s" "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
 validate_hostname() {
-    H="$1"
-    [ -n "$H" ] || return 1
-    case "$H" in
-        *[!A-Za-z0-9._-]* ) return 1 ;;
-        .*|*..*|*.) return 1 ;;
-    esac
-    return 0
-}
-
-validate_ipv4() {
-    IP="$(trim "$1")"
-    [ -n "$IP" ] || return 1
-    echo "$IP" | awk -F. '
-        NF != 4 { exit 1 }
-        {
-            for (i = 1; i <= 4; i++) {
-                if ($i !~ /^[0-9]+$/) exit 1
-                if ($i < 0 || $i > 255) exit 1
-            }
-        }
-    ' >/dev/null 2>&1
-}
-
-validate_cidr() {
-    C="$(trim "$1")"
-    [ -n "$C" ] || return 1
-    case "$C" in
-        */*) ;;
-        *) return 1 ;;
-    esac
-    IP="${C%/*}"
-    MASK="${C#*/}"
-    validate_ipv4 "$IP" || return 1
-    case "$MASK" in
-        *[!0-9]*|'') return 1 ;;
-    esac
-    [ "$MASK" -ge 0 ] 2>/dev/null && [ "$MASK" -le 32 ] 2>/dev/null
+	case "$1" in
+		"") return 1 ;;
+		*[!A-Za-z0-9._-]*) return 1 ;;
+		.*|*..*|*.) return 1 ;;
+	esac
+	return 0
 }
 
 validate_port() {
-    P="$1"
-    [ -n "$P" ] || return 1
-    case "$P" in
-        *[!0-9]* ) return 1 ;;
-    esac
-    [ "$P" -ge 1 ] 2>/dev/null && [ "$P" -le 65535 ] 2>/dev/null
+	case "$1" in
+		"") return 1 ;;
+		*[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
 }
 
-ask_yes_no() {
-    PROMPT="$1"
-    DEFAULT="$2"
+# Accepts "host", "host:port", "https://host/path" and anything in between.
+parse_server() {
+	_s="$(trim "$1")"
+	_s="${_s#http://}"
+	_s="${_s#https://}"
+	_s="${_s%%/*}"
 
-    case "$DEFAULT" in
-        y|Y) SUFFIX="[Y/n]" ;;
-        *)   SUFFIX="[y/N]" ;;
-    esac
-
-    ANSWER="$(read_line "$PROMPT $SUFFIX" "")"
-    [ -n "$ANSWER" ] || ANSWER="$DEFAULT"
-
-    case "$ANSWER" in
-        y|Y|yes|YES|Yes|д|Д|да|ДА|Да) return 0 ;;
-        *) return 1 ;;
-    esac
+	SERVER="${_s%%:*}"
+	case "$_s" in
+		*:*) PORT="${_s##*:}" ;;
+		*)   PORT="" ;;
+	esac
 }
 
-ask_credentials() {
-    echo
-    echo "=== SSTP connection parameters ==="
+ask_params() {
+	echo
+	echo "=== SSTP management tunnel ==="
 
-    RAW_SERVER="$(read_line "SSTP server hostname, without https://" "")"
-    SERVER="$(sanitize_server "$RAW_SERVER")"
+	parse_server "$(read_line "SSTP server (host or host:port)" "")"
+	USERNAME="$(trim "$(read_line "Username" "")")"
+	PASSWORD="$(read_secret "Password: ")"
 
-    VPNUSER="$(trim "$(read_line "Username" "")")"
-    VPNPASS="$(read_secret "Password: ")"
+	validate_hostname "$SERVER" || die "Bad server name: '${SERVER}'"
+	[ -z "$PORT" ] || validate_port "$PORT" || die "Bad port: '${PORT}'"
+	[ -n "$USERNAME" ] || die "Username is empty."
+	[ -n "$PASSWORD" ] || die "Password is empty."
 
-    [ -n "$SERVER" ] || die "Server is empty."
-    [ -n "$VPNUSER" ] || die "Username is empty."
-    [ -n "$VPNPASS" ] || die "Password is empty."
+	case "$USERNAME" in
+		*[\'\"\\]*) die "Username contains quotes or backslashes, sstpc cannot take it." ;;
+	esac
 
-    validate_hostname "$SERVER" || die "Server contains unsupported characters after sanitizing: $SERVER"
-
-    ENABLE_SERVER_FILE_ROUTE="0"
-    SERVER_LAN_CIDR=""
-    SERVER_FILE_IP=""
-    SERVER_FILE_PORT=""
-
-    echo
-    echo "=== Optional server-side file access ==="
-    echo "Use this only if this OpenWrt router must download a file from LAN behind SSTP server."
-    echo "Default server-side LAN: ${DEFAULT_SERVER_LAN_CIDR}, Debian/file server: ${DEFAULT_SERVER_FILE_IP}:${DEFAULT_SERVER_FILE_PORT}."
-    echo "Press Enter on the next prompts to use these defaults."
-
-    if ask_yes_no "Add route to LAN behind SSTP server and allow router to one file server" "n"; then
-        ENABLE_SERVER_FILE_ROUTE="1"
-        SERVER_LAN_CIDR="$(trim "$(read_line "Server-side LAN CIDR" "$DEFAULT_SERVER_LAN_CIDR")")"
-        SERVER_FILE_IP="$(trim "$(read_line "Debian/file server IP" "$DEFAULT_SERVER_FILE_IP")")"
-        SERVER_FILE_PORT="$(trim "$(read_line "Debian/file server TCP port" "$DEFAULT_SERVER_FILE_PORT")")"
-
-        # If user enters only spaces, fall back to defaults too.
-        [ -n "$SERVER_LAN_CIDR" ] || SERVER_LAN_CIDR="$DEFAULT_SERVER_LAN_CIDR"
-        [ -n "$SERVER_FILE_IP" ] || SERVER_FILE_IP="$DEFAULT_SERVER_FILE_IP"
-        [ -n "$SERVER_FILE_PORT" ] || SERVER_FILE_PORT="$DEFAULT_SERVER_FILE_PORT"
-
-        validate_cidr "$SERVER_LAN_CIDR" || die "Invalid server-side LAN CIDR: $SERVER_LAN_CIDR"
-        validate_ipv4 "$SERVER_FILE_IP" || die "Invalid file server IP: $SERVER_FILE_IP"
-        validate_port "$SERVER_FILE_PORT" || die "Invalid file server port: $SERVER_FILE_PORT"
-    fi
-
-    echo
-    log "Server: $SERVER"
-    log "Username: $VPNUSER"
-    if [ "$ENABLE_SERVER_FILE_ROUTE" = "1" ]; then
-        log "Server-side LAN route: $SERVER_LAN_CIDR via SSTP"
-        log "Allowed router-originated file access: $SERVER_FILE_IP:$SERVER_FILE_PORT via SSTP"
-    else
-        log "Server-side LAN route: disabled"
-    fi
+	echo
+	log "Server: ${SERVER}${PORT:+:$PORT}"
+	log "Username: ${USERNAME}"
 }
 
-get_arch() {
-    opkg print-architecture | awk '$1=="arch" && $2!="all" && $2!="noarch" { if ($3>p) { p=$3; a=$2 } } END { print a }'
+# --------------------------------------------------------------- preflight
+
+resolve_host() {
+	if have resolveip; then
+		resolveip -4 -t 5 "$1" 2>/dev/null | head -3
+		return
+	fi
+	if have nslookup; then
+		# busybox prints answers as "Address 1: 1.2.3.4 name" and the resolver
+		# itself as "Address: 127.0.0.1:53", so take only the numbered lines.
+		nslookup "$1" 2>/dev/null | awk '/^Address +[0-9]+: / {
+			for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+(\.[0-9]+){3}$/) print $i
+		}' | head -3
+		return
+	fi
+	ping -4 -c 1 -w 5 "$1" 2>/dev/null | sed -n '1s/.*(\([0-9.]*\)).*/\1/p'
 }
 
-stop_sstp() {
-    ifdown "$SSTP_IF" 2>/dev/null || true
-    killall sstpc 2>/dev/null || true
-    killall pppd 2>/dev/null || true
+check_uplink() {
+	log "Checking that ${SERVER} resolves"
+	SERVER_IPS="$(resolve_host "$SERVER")"
+	[ -n "$SERVER_IPS" ] || die "Cannot resolve ${SERVER}. Fix WAN/DNS first, nothing was changed."
+	ok "Resolved to: $(echo "$SERVER_IPS" | tr '\n' ' ')"
+
+	_port="${PORT:-443}"
+	if have nc; then
+		log "Probing TCP ${SERVER}:${_port}"
+		if nc -w 5 "$SERVER" "$_port" </dev/null >/dev/null 2>&1; then
+			ok "Port ${_port} accepts connections"
+		else
+			warn "Cannot open TCP ${SERVER}:${_port}. Continuing, but the tunnel will"
+			warn "not come up if the server really is unreachable."
+		fi
+	fi
 }
 
-install_sstp_package_fixed() {
-    log "Updating package lists..."
-    opkg update || die "opkg update failed. Check WAN/internet access."
+check_listeners() {
+	have netstat || return 0
+	_l="$(netstat -ltn 2>/dev/null)"
+	case "$_l" in
+		*":22 "*) ;;
+		*) warn "Nothing is listening on TCP 22 (dropbear off?), SSH over the tunnel will fail." ;;
+	esac
+	case "$_l" in
+		*":80 "*) ;;
+		*) warn "Nothing is listening on TCP 80 (uhttpd off?), LuCI over the tunnel will fail." ;;
+	esac
+}
 
-    log "Installing sstp-client dependencies/package from current OpenWrt repo..."
-    opkg install sstp-client || die "Cannot install sstp-client from current repo."
+# ---------------------------------------------------------------- backup
 
-    ARCH="$(get_arch)"
-    [ -n "$ARCH" ] || die "ARCH detection failed."
-    log "Detected opkg architecture: $ARCH"
+backup_configs() {
+	umask 077
+	mkdir -p "$BACKUP_DIR" || die "Cannot create ${BACKUP_DIR}"
+	chmod 700 "$BACKUP_DIR"
 
-    PKG="sstp-client_${FIXED_SSTP_VERSION}_${ARCH}.ipk"
-    URL="https://downloads.openwrt.org/releases/${FIXED_OWRT_RELEASE}/packages/${ARCH}/packages/${PKG}"
+	TS="$(date +%F-%H%M%S)"
+	NET_BAK="${BACKUP_DIR}/network.${TS}.bak"
+	FW_BAK="${BACKUP_DIR}/firewall.${TS}.bak"
 
-    log "Downloading known-working sstp-client ${FIXED_SSTP_VERSION}: $URL"
-    wget -O "/tmp/$PKG" "$URL" || die "Cannot download fixed sstp-client package: $URL"
+	cp /etc/config/network "$NET_BAK" || die "Cannot back up /etc/config/network"
+	cp /etc/config/firewall "$FW_BAK" || die "Cannot back up /etc/config/firewall"
 
-    log "Forcing downgrade/install of sstp-client ${FIXED_SSTP_VERSION}"
-    opkg install --force-downgrade "/tmp/$PKG" || die "Failed to install fixed sstp-client package."
+	# Keep the last 10 pairs, these files contain the tunnel password.
+	ls -1t "$BACKUP_DIR"/network.*.bak 2>/dev/null | tail -n +11 | while read -r f; do rm -f "$f"; done
+	ls -1t "$BACKUP_DIR"/firewall.*.bak 2>/dev/null | tail -n +11 | while read -r f; do rm -f "$f"; done
 
-    [ -x /usr/bin/sstpc ] || die "/usr/bin/sstpc not found after install."
-    [ -x /lib/netifd/proto/sstp.sh ] || die "/lib/netifd/proto/sstp.sh not found after install."
+	umask 022
+	ok "Backups: ${NET_BAK}, ${FW_BAK}"
+}
 
-    log "Installed package: $(opkg list-installed | grep '^sstp-client' || true)"
+# ---------------------------------------------------------------- packages
+
+pkg_version() {
+	case "$PKG" in
+		opkg)
+			opkg list-installed sstp-client 2>/dev/null | awk '{ print $3; exit }'
+			;;
+		apk)
+			# Read the package db directly instead of parsing apk CLI output.
+			awk -v want="sstp-client" '
+				/^P:/ { pkg = substr($0, 3) }
+				/^V:/ { if (pkg == want) { print substr($0, 3); exit } }
+			' /lib/apk/db/installed 2>/dev/null
+			;;
+	esac
+}
+
+# opkg package lists land in /var/opkg-lists, which is tmpfs. On a 64 MB router
+# that is the single biggest memory cost of this script, so skip the update when
+# the lists are less than a day old and drop them as soon as we are done.
+opkg_lists_fresh() {
+	[ -d /var/opkg-lists ] || return 1
+	[ -n "$(find /var/opkg-lists -maxdepth 1 -type f -mtime -1 2>/dev/null | head -1)" ]
+}
+
+pkg_cache_clean() {
+	case "$PKG" in
+		opkg) rm -rf /var/opkg-lists/* 2>/dev/null || true ;;
+		apk)  rm -rf /var/cache/apk/* 2>/dev/null || true ;;
+	esac
+	sync 2>/dev/null || true
+}
+
+install_package() {
+	_installed="$(pkg_version)"
+	if [ -n "$_installed" ] && [ -x /usr/bin/sstpc ]; then
+		ok "sstp-client ${_installed} already installed, not touching the repos"
+		return 0
+	fi
+
+	[ "$OVERLAY_KB" -ge "$MIN_OVERLAY_KB" ] 2>/dev/null \
+		|| die "Only ${OVERLAY_KB} KiB free on the overlay, sstp-client needs about ${MIN_OVERLAY_KB} KiB."
+
+	case "$PKG" in
+		opkg)
+			if opkg_lists_fresh; then
+				log "Package lists are fresh, skipping opkg update"
+			else
+				[ "$MEM_KB" -ge "$MIN_MEM_KB" ] 2>/dev/null || die \
+					"Only ${MEM_KB} KiB RAM available, opkg update needs about ${MIN_MEM_KB} KiB. Reboot and retry."
+				log "opkg update"
+				opkg update >/dev/null || { pkg_cache_clean; die "opkg update failed, check the uplink."; }
+			fi
+			log "Installing sstp-client"
+			opkg install sstp-client >/dev/null || { pkg_cache_clean; die "Cannot install sstp-client."; }
+			;;
+		apk)
+			log "apk update"
+			apk update >/dev/null 2>&1 || warn "apk update failed, trying the cached index"
+			log "Installing sstp-client"
+			apk add sstp-client >/dev/null 2>&1 || { pkg_cache_clean; die "Cannot install sstp-client."; }
+			;;
+	esac
+
+	pkg_cache_clean
+	ok "Installed sstp-client $(pkg_version), package lists dropped to free RAM"
+}
+
+check_package_files() {
+	[ -x /usr/bin/sstpc ] || die "/usr/bin/sstpc missing after install."
+	[ -f /usr/lib/sstp-pppd-plugin.so ] || warn "/usr/lib/sstp-pppd-plugin.so missing, pppd integration may fail."
+	[ -x /usr/sbin/pppd ] || die "/usr/sbin/pppd missing, install the ppp package."
+	[ -x /lib/netifd/ppp-up ] || die "/lib/netifd/ppp-up missing, netifd ppp support is incomplete."
+}
+
+# Last resort for opkg systems: the 1.0.15-1 build whose stack layout survives
+# the args[20] overflow. Not possible under apk, 25.12 ships the same 1.0.20-r1.
+pin_old_sstp_client() {
+	[ "$PKG" = "opkg" ] || return 1
+
+	_arch="$(opkg print-architecture | awk '$1 == "arch" && $2 != "all" && $2 != "noarch" { if (+$3 > +p) { p = $3; a = $2 } } END { print a }')"
+	[ -n "$_arch" ] || { warn "Cannot detect the opkg architecture, skipping the pin."; return 1; }
+
+	_pkg="sstp-client_${PIN_VERSION}_${_arch}.ipk"
+	_url="https://downloads.openwrt.org/releases/${PIN_RELEASE}/packages/${_arch}/packages/${_pkg}"
+
+	log "Downloading sstp-client ${PIN_VERSION} (${_arch})"
+	if ! wget -q -O "/tmp/${_pkg}" "$_url"; then
+		rm -f "/tmp/${_pkg}"
+		warn "Cannot download ${_url}"
+		return 1
+	fi
+
+	log "Installing sstp-client ${PIN_VERSION} over the current one"
+	if ! opkg install --force-downgrade "/tmp/${_pkg}" >/dev/null; then
+		rm -f "/tmp/${_pkg}"
+		warn "Cannot install ${_pkg}"
+		return 1
+	fi
+
+	rm -f "/tmp/${_pkg}"
+	ok "Pinned sstp-client $(pkg_version). An opkg upgrade will undo this."
+	return 0
+}
+
+# ------------------------------------------------------- protocol handler
+
+install_proto_files() {
+	log "Installing the ${PROTO} protocol handler"
+
+	mkdir -p /etc/ppp /lib/netifd/proto
+
+	cat > "$PPP_OPTS_FILE" <<'EOF'
+# Managed by openwrt-sstp-tunnel, edits are overwritten on reinstall.
+#
+# These options live in a file instead of the sstpc command line because
+# sstp-client can only forward 8 arguments to pppd before it overflows its
+# fixed args[20] buffer (openwrt/packages#27318).
+#
+# pppd is started as root, so "file" on its command line keeps privileged_option
+# set while reading this file. That is what makes the OPT_PRIV options below
+# (ip-up-script and friends) acceptable here rather than only on the argv.
+require-mschap-v2
+refuse-pap
+noauth
+nodefaultroute
+noipv6
+ip-up-script /lib/netifd/ppp-up
+ipv6-up-script /lib/netifd/ppp-up
+ip-down-script /lib/netifd/ppp-down
+ipv6-down-script /lib/netifd/ppp-down
+lcp-echo-interval 20
+lcp-echo-failure 3
+EOF
+	chmod 644 "$PPP_OPTS_FILE"
+
+	cat > "$PROTO_FILE" <<'EOF'
+#!/bin/sh
+# Managed by openwrt-sstp-tunnel, edits are overwritten on reinstall.
+#
+# Minimal SSTP protocol handler for a management tunnel. It exists because the
+# stock /lib/netifd/proto/sstp.sh hands pppd 13 arguments while sstp-client can
+# only carry 8 (fixed args[20] in sstp_pppd_start, 11 slots plus NULL are used
+# by sstpc itself). The overflow corrupts sstpc's stack and pppd then dies with
+# "unrecognized option <garbage>". See openwrt/packages#27318.
+#
+# Permanent pppd options are in /etc/ppp/options.sstpm, so this passes 4
+# arguments (8 with mtu set), which fits.
+
+[ -x /usr/bin/sstpc ] || exit 0
+
+PPP_OPTS="/etc/ppp/options.sstpm"
+
+[ -n "$INCLUDE_ONLY" ] || {
+	. /lib/functions.sh
+	. ../netifd-proto.sh
+	init_proto "$@"
+}
+
+proto_sstpm_init_config() {
+	proto_config_add_string "server"
+	proto_config_add_string "port"
+	proto_config_add_string "username"
+	proto_config_add_string "password"
+	proto_config_add_string "sstp_options"
+	proto_config_add_int "log_level"
+	proto_config_add_int "mtu"
+	available=1
+	no_device=1
+}
+
+proto_sstpm_setup() {
+	local config="$1"
+	local ifname="sstp-$config"
+	local ip serv_addr server port username password sstp_options log_level mtu
+
+	[ -f "$PPP_OPTS" ] || {
+		echo "Missing $PPP_OPTS, reinstall openwrt-sstp-tunnel"
+		proto_notify_error "$config" NO_PPP_OPTIONS
+		proto_block_restart "$config"
+		exit 1
+	}
+
+	json_get_vars server port username password sstp_options log_level mtu
+
+	for ip in $(resolveip -4 -t 5 "$server"); do
+		( proto_add_host_dependency "$config" "$ip" )
+		serv_addr=1
+	done
+	[ -n "$serv_addr" ] || {
+		echo "Could not resolve $server"
+		sleep 5
+		proto_setup_failed "$config"
+		exit 1
+	}
+
+	[ -n "$log_level" ] || log_level=1
+
+	proto_init_update "$ifname" 1
+	proto_send_update "$config"
+
+	# Unquoted optional expansions on purpose: an empty argument would reach
+	# pppd as "" and be reported as an unrecognized option.
+	proto_run_command "$config" /usr/bin/sstpc \
+		--cert-warn \
+		--log-level "$log_level" \
+		--save-server-route \
+		--ipparam "$config" \
+		--user "$username" \
+		--password "$password" \
+		$sstp_options \
+		"$server${port:+:$port}" \
+		file "$PPP_OPTS" \
+		ifname "$ifname" \
+		${mtu:+mtu $mtu mru $mtu}
+
+	# The ppp device shows up after sstpc and pppd have negotiated, netifd and
+	# fw4 need a nudge to attach the zone to it (same workaround as upstream).
+	sleep 10
+	proto_init_update "$ifname" 1
+	proto_send_update "$config"
+	/etc/init.d/firewall reload >/dev/null 2>&1
+}
+
+proto_sstpm_teardown() {
+	local config="$1"
+
+	case "$ERROR" in
+		11|19)
+			proto_notify_error "$config" AUTH_FAILED
+			proto_block_restart "$config"
+		;;
+		2)
+			proto_notify_error "$config" INVALID_OPTIONS
+			proto_block_restart "$config"
+		;;
+	esac
+	proto_kill_command "$config"
+}
+
+[ -n "$INCLUDE_ONLY" ] || {
+	add_protocol sstpm
+}
+EOF
+	chmod 755 "$PROTO_FILE"
+	sh -n "$PROTO_FILE" || die "Generated ${PROTO_FILE} is not valid shell."
+	ok "Handler installed, pppd argument count: 4 of 8 allowed"
+}
+
+install_hotplug() {
+	mkdir -p "$(dirname "$HOTPLUG_FILE")"
+
+	cat > "$HOTPLUG_FILE" <<EOF
+#!/bin/sh
+# Managed by openwrt-sstp-tunnel, edits are overwritten on reinstall.
+# Safety net for the case where netifd gave up on the tunnel while the uplink
+# was down. One restart per five minutes at most.
+
+[ "\$ACTION" = "ifup" ] || exit 0
+[ "\$INTERFACE" = "${NET_SECTION}" ] && exit 0
+case "\${DEVICE:-}" in sstp-*) exit 0 ;; esac
+
+LOCK="/tmp/sstp-tunnel-nudge.lock"
+NOW="\$(date +%s)"
+if [ -f "\$LOCK" ]; then
+	read -r THEN < "\$LOCK" 2>/dev/null || THEN=0
+	[ "\$(( NOW - \${THEN:-0} ))" -lt 300 ] && exit 0
+fi
+echo "\$NOW" > "\$LOCK"
+
+(
+	sleep 20
+	STATUS="\$(ifstatus ${NET_SECTION} 2>/dev/null)"
+	case "\$STATUS" in
+		*'"up": true'*|*'"pending": true'*) exit 0 ;;
+	esac
+
+	logger -t sstp-tunnel "tunnel down after \$INTERFACE came up, restarting it once"
+	ifdown ${NET_SECTION} 2>/dev/null
+	sleep 3
+	ifup ${NET_SECTION} 2>/dev/null
+) &
+# The lock is deliberately left behind: its age is what rate limits this to one
+# attempt per five minutes, however many interfaces come up in a row.
+
+exit 0
+EOF
+	chmod 755 "$HOTPLUG_FILE"
+	sh -n "$HOTPLUG_FILE" || die "Generated ${HOTPLUG_FILE} is not valid shell."
+}
+
+# ------------------------------------------------------------------- config
+
+purge_sections() {
+	for _s in $NET_SECTIONS; do
+		uci -q delete "network.${_s}" || true
+	done
+	for _s in $FW_SECTIONS; do
+		uci -q delete "firewall.${_s}" || true
+	done
+}
+
+stop_tunnel() {
+	ifdown "$NET_SECTION" 2>/dev/null || true
+
+	# Kill only what belongs to this tunnel: sstpc is started with
+	# "--ipparam sstp" and its pppd with "ifname sstp-sstp". A PPPoE WAN or a
+	# second tunnel must survive.
+	if have pgrep; then
+		for _p in $(pgrep -f "ipparam ${NET_SECTION}" 2>/dev/null) \
+			  $(pgrep -f "ifname sstp-${NET_SECTION}" 2>/dev/null); do
+			kill "$_p" 2>/dev/null || true
+		done
+	else
+		killall sstpc 2>/dev/null || true
+	fi
 }
 
 configure_network() {
-    log "Configuring network interface: $SSTP_IF"
+	log "Configuring network.${NET_SECTION}"
 
-    uci -q delete network.$SSTP_IF
-    uci -q delete network.$ROUTE_SECTION
-
-    uci set network.$SSTP_IF='interface'
-    uci set network.$SSTP_IF.proto='sstp'
-    uci set network.$SSTP_IF.server="$SERVER"
-    uci set network.$SSTP_IF.username="$VPNUSER"
-    uci set network.$SSTP_IF.password="$VPNPASS"
-    uci set network.$SSTP_IF.log_level='4'
-    uci set network.$SSTP_IF.sstp_options='--tls-ext'
-    uci set network.$SSTP_IF.defaultroute='0'
-    uci set network.$SSTP_IF.peerdns='0'
-    uci set network.$SSTP_IF.ipv6='0'
-    uci set network.$SSTP_IF.auto='1'
-
-    if [ "$ENABLE_SERVER_FILE_ROUTE" = "1" ]; then
-        uci set network.$ROUTE_SECTION='route'
-        uci set network.$ROUTE_SECTION.interface="$SSTP_IF"
-        uci set network.$ROUTE_SECTION.target="$SERVER_LAN_CIDR"
-    fi
-
-    uci commit network || die "uci commit network failed."
+	uci set "network.${NET_SECTION}=interface"
+	uci set "network.${NET_SECTION}.proto=${PROTO}"
+	uci set "network.${NET_SECTION}.server=${SERVER}"
+	[ -z "$PORT" ] || uci set "network.${NET_SECTION}.port=${PORT}"
+	uci set "network.${NET_SECTION}.username=${USERNAME}"
+	uci set "network.${NET_SECTION}.password=${PASSWORD}"
+	uci set "network.${NET_SECTION}.sstp_options=--tls-ext"
+	uci set "network.${NET_SECTION}.log_level=1"
+	uci set "network.${NET_SECTION}.auto=1"
 }
 
 configure_firewall() {
-    log "Configuring firewall: allow ONLY SSH(22), HTTP(80), ping from SSTP"
+	log "Configuring the ${ZONE} firewall zone: 22, 80, ping in, nothing else"
 
-    uci -q delete firewall.sstp
-    uci -q delete firewall.allow_ssh_from_sstp
-    uci -q delete firewall.allow_http_from_sstp
-    uci -q delete firewall.allow_https_from_sstp
-    uci -q delete firewall.allow_ping_from_sstp
-    uci -q delete firewall.sstp_to_lan
-    uci -q delete firewall.lan_to_sstp
-    uci -q delete firewall.$FILE_RULE_SECTION
+	uci set "firewall.${ZONE}=zone"
+	uci set "firewall.${ZONE}.name=${ZONE}"
+	uci set "firewall.${ZONE}.network=${NET_SECTION}"
+	uci set "firewall.${ZONE}.input=REJECT"
+	uci set "firewall.${ZONE}.forward=REJECT"
+	uci set "firewall.${ZONE}.output=REJECT"
 
-    uci set firewall.sstp='zone'
-    uci set firewall.sstp.name='sstp'
-    uci set firewall.sstp.network='sstp'
-    uci set firewall.sstp.input='REJECT'
-    uci set firewall.sstp.forward='REJECT'
-    uci set firewall.sstp.output='REJECT'
+	uci set firewall.allow_ssh_from_sstp=rule
+	uci set firewall.allow_ssh_from_sstp.name=Allow-SSH-from-SSTP
+	uci set firewall.allow_ssh_from_sstp.src="$ZONE"
+	uci set firewall.allow_ssh_from_sstp.proto=tcp
+	uci set firewall.allow_ssh_from_sstp.dest_port=22
+	uci set firewall.allow_ssh_from_sstp.target=ACCEPT
 
-    uci set firewall.allow_ssh_from_sstp='rule'
-    uci set firewall.allow_ssh_from_sstp.name='Allow-SSH-from-SSTP'
-    uci set firewall.allow_ssh_from_sstp.src='sstp'
-    uci set firewall.allow_ssh_from_sstp.proto='tcp'
-    uci set firewall.allow_ssh_from_sstp.dest_port='22'
-    uci set firewall.allow_ssh_from_sstp.target='ACCEPT'
+	uci set firewall.allow_http_from_sstp=rule
+	uci set firewall.allow_http_from_sstp.name=Allow-HTTP-from-SSTP
+	uci set firewall.allow_http_from_sstp.src="$ZONE"
+	uci set firewall.allow_http_from_sstp.proto=tcp
+	uci set firewall.allow_http_from_sstp.dest_port=80
+	uci set firewall.allow_http_from_sstp.target=ACCEPT
 
-    uci set firewall.allow_http_from_sstp='rule'
-    uci set firewall.allow_http_from_sstp.name='Allow-HTTP-from-SSTP'
-    uci set firewall.allow_http_from_sstp.src='sstp'
-    uci set firewall.allow_http_from_sstp.proto='tcp'
-    uci set firewall.allow_http_from_sstp.dest_port='80'
-    uci set firewall.allow_http_from_sstp.target='ACCEPT'
-
-    uci set firewall.allow_ping_from_sstp='rule'
-    uci set firewall.allow_ping_from_sstp.name='Allow-Ping-from-SSTP'
-    uci set firewall.allow_ping_from_sstp.src='sstp'
-    uci set firewall.allow_ping_from_sstp.proto='icmp'
-    uci set firewall.allow_ping_from_sstp.icmp_type='echo-request'
-    uci set firewall.allow_ping_from_sstp.family='ipv4'
-    uci set firewall.allow_ping_from_sstp.target='ACCEPT'
-
-    if [ "$ENABLE_SERVER_FILE_ROUTE" = "1" ]; then
-        log "Configuring firewall: allow router-originated TCP access to $SERVER_FILE_IP:$SERVER_FILE_PORT via SSTP"
-
-        uci set firewall.$FILE_RULE_SECTION='rule'
-        uci set firewall.$FILE_RULE_SECTION.name='Allow-router-to-server-file-over-SSTP'
-        uci set firewall.$FILE_RULE_SECTION.src='*'
-        uci set firewall.$FILE_RULE_SECTION.dest='sstp'
-        uci set firewall.$FILE_RULE_SECTION.dest_ip="$SERVER_FILE_IP"
-        uci set firewall.$FILE_RULE_SECTION.proto='tcp'
-        uci set firewall.$FILE_RULE_SECTION.dest_port="$SERVER_FILE_PORT"
-        uci set firewall.$FILE_RULE_SECTION.target='ACCEPT'
-    fi
-
-    uci commit firewall || die "uci commit firewall failed."
+	uci set firewall.allow_ping_from_sstp=rule
+	uci set firewall.allow_ping_from_sstp.name=Allow-Ping-from-SSTP
+	uci set firewall.allow_ping_from_sstp.src="$ZONE"
+	uci set firewall.allow_ping_from_sstp.proto=icmp
+	uci set firewall.allow_ping_from_sstp.icmp_type=echo-request
+	uci set firewall.allow_ping_from_sstp.family=ipv4
+	uci set firewall.allow_ping_from_sstp.target=ACCEPT
 }
 
-configure_hotplug() {
-    log "Configuring safe SSTP autostart after WAN is up"
+# ------------------------------------------------------------------ rollback
 
-    cat > "$HOTPLUG_FILE" <<'EOH'
+# Armed before the first service restart: if this installer never confirms
+# success, the previous configs come back without anyone having to log in.
+rollback_arm() {
+	mkdir -p "$STATE_DIR"
+	rm -f "${STATE_DIR}/ok"
+
+	cat > "${STATE_DIR}/rollback.sh" <<EOF
 #!/bin/sh
-[ "$ACTION" = "ifup" ] || exit 0
-[ "$INTERFACE" = "wan" ] || exit 0
+waited=0
+while [ "\$waited" -lt ${ROLLBACK_WAIT} ]; do
+	[ -f "${STATE_DIR}/ok" ] && exit 0
+	sleep 5
+	waited="\$(( waited + 5 ))"
+done
 
-LOCK="/tmp/sstp-wan-restart.lock"
-[ -e "$LOCK" ] && exit 0
-touch "$LOCK"
+logger -t sstp-tunnel "installer did not confirm success in ${ROLLBACK_WAIT}s, restoring previous config"
+ifdown ${NET_SECTION} 2>/dev/null
+killall sstpc 2>/dev/null
+cp "${NET_BAK}" /etc/config/network
+cp "${FW_BAK}" /etc/config/firewall
+rm -f "${HOTPLUG_FILE}"
+/etc/init.d/firewall restart >/dev/null 2>&1
+/etc/init.d/network restart >/dev/null 2>&1
+logger -t sstp-tunnel "previous config restored"
+EOF
+	chmod 755 "${STATE_DIR}/rollback.sh"
 
-(
-    sleep 30
+	if have setsid; then
+		setsid "${STATE_DIR}/rollback.sh" >/dev/null 2>&1 &
+	else
+		"${STATE_DIR}/rollback.sh" >/dev/null 2>&1 &
+	fi
 
-    STATUS="$(ifstatus sstp 2>/dev/null)"
-    echo "$STATUS" | grep -q '"up": true' && rm -f "$LOCK" && exit 0
-    echo "$STATUS" | grep -q '"pending": true' && rm -f "$LOCK" && exit 0
-
-    logger -t sstp-autostart "SSTP is down after WAN ifup, trying one restart"
-    ifdown sstp 2>/dev/null || true
-    sleep 3
-    ifup sstp 2>/dev/null || true
-
-    rm -f "$LOCK"
-) &
-
-exit 0
-EOH
-
-    chmod +x "$HOTPLUG_FILE" || die "Cannot chmod $HOTPLUG_FILE"
+	ok "Unattended rollback armed for ${ROLLBACK_WAIT}s"
 }
 
-reload_services() {
-    log "Restarting network and firewall"
-    /etc/init.d/firewall restart 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null || true
-    /etc/init.d/network restart || die "network restart failed"
-    sleep 10
+rollback_disarm() {
+	mkdir -p "$STATE_DIR"
+	: > "${STATE_DIR}/ok"
 }
+
+rollback_now() {
+	warn "Restoring the previous configuration"
+	rollback_disarm
+	stop_tunnel
+	cp "$NET_BAK" /etc/config/network 2>/dev/null || true
+	cp "$FW_BAK" /etc/config/firewall 2>/dev/null || true
+	rm -f "$HOTPLUG_FILE"
+	/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	/etc/init.d/network reload >/dev/null 2>&1 || true
+	warn "Rolled back. ${PROTO_FILE} is left in place but inactive."
+}
+
+# -------------------------------------------------------------------- apply
+
+apply_config() {
+	uci commit network || die "uci commit network failed."
+	uci commit firewall || die "uci commit firewall failed."
+	chmod 600 /etc/config/network
+
+	log "Reloading firewall"
+	/etc/init.d/firewall reload >/dev/null 2>&1 || /etc/init.d/firewall restart >/dev/null 2>&1 || true
+
+	log "Reloading network"
+	/etc/init.d/network reload >/dev/null 2>&1 || true
+	sleep 3
+
+	# netifd registers protocol handlers at startup, so a brand new handler is
+	# unknown until it restarts. Avoid that restart whenever we can: it briefly
+	# flaps every interface on the router. An interface whose protocol is
+	# unknown either disappears or falls back to "none", so check the protocol
+	# netifd actually reports, not just that the interface exists.
+	if proto_is_live; then
+		ok "netifd already knows the ${PROTO} protocol, no restart needed"
+	else
+		warn "netifd does not know ${PROTO} yet, restarting it once (brief network flap)"
+		/etc/init.d/network restart >/dev/null 2>&1 || die "network restart failed."
+		sleep 8
+		proto_is_live \
+			|| die "netifd still does not accept protocol ${PROTO}, check 'logread -e netifd'."
+	fi
+}
+
+proto_is_live() {
+	ifstatus "$NET_SECTION" 2>/dev/null | grep -q "\"proto\": *\"${PROTO}\""
+}
+
+bring_up() {
+	log "Bringing the tunnel up"
+	ifup "$NET_SECTION" 2>/dev/null || true
+
+	_waited=0
+	while [ "$_waited" -lt "$UP_TIMEOUT" ]; do
+		_status="$(ifstatus "$NET_SECTION" 2>/dev/null)"
+		case "$_status" in
+			*'"up": true'*) return 0 ;;
+			*AUTH_FAILED*)  err "Server rejected the credentials (AUTH_FAILED)."; return 2 ;;
+			*NO_PPP_OPTIONS*) err "The handler cannot find ${PPP_OPTS_FILE}."; return 2 ;;
+		esac
+		sleep 3
+		_waited="$(( _waited + 3 ))"
+	done
+	return 1
+}
+
+# Remember how long the ring buffer is, so the overflow check below only ever
+# looks at lines produced by our own attempt. A stale "unrecognized option" from
+# an earlier attempt must not trigger the version pin.
+log_mark() {
+	LOG_MARK="$(logread 2>/dev/null | wc -l | tr -d ' ')"
+	[ -n "$LOG_MARK" ] || LOG_MARK="0"
+}
+
+# Did we hit the args[20] overflow? That is the one failure the version pin fixes.
+hit_arg_overflow() {
+	logread 2>/dev/null | tail -n "+$(( ${LOG_MARK:-0} + 1 ))" | grep -qi 'unrecognized option'
+}
+
+verify() {
+	_rc=0
+
+	_dev="$(ifstatus "$NET_SECTION" 2>/dev/null | sed -n 's/.*"l3_device": *"\([^"]*\)".*/\1/p' | head -1)"
+	if [ -n "$_dev" ] && ip link show "$_dev" >/dev/null 2>&1; then
+		ok "Device: ${_dev}"
+	else
+		err "No ppp device for the tunnel"
+		_rc=1
+	fi
+
+	_ip="$(ifstatus "$NET_SECTION" 2>/dev/null | sed -n 's/.*"address": *"\([0-9.]*\)".*/\1/p' | head -1)"
+	if [ -n "$_ip" ]; then
+		ok "Tunnel address: ${_ip}"
+	else
+		err "The tunnel has no IPv4 address"
+		_rc=1
+	fi
+
+	if have nft; then
+		if nft list table inet fw4 2>/dev/null | grep -q 'Allow-SSH-from-SSTP'; then
+			ok "Firewall rules are live in nftables"
+		else
+			err "Allow-SSH-from-SSTP is not in the live ruleset"
+			_rc=1
+		fi
+	elif have iptables-save; then
+		if iptables-save 2>/dev/null | grep -q 'Allow-SSH-from-SSTP'; then
+			ok "Firewall rules are live in iptables"
+		else
+			err "Allow-SSH-from-SSTP is not in the live ruleset"
+			_rc=1
+		fi
+	fi
+
+	check_listeners
+	return "$_rc"
+}
+
+# --------------------------------------------------------------- commands
 
 install_cmd() {
-    need_root
-    need_openwrt
-    ask_credentials
-    backup_configs
-    stop_sstp
-    install_sstp_package_fixed
-    configure_network
-    configure_firewall
-    configure_hotplug
-    reload_services
+	require_root
+	detect_platform
+	check_resources
+	ask_params
+	check_uplink
 
-    log "Bringing SSTP up"
-    ifup "$SSTP_IF" 2>/dev/null || true
-    sleep 12
+	backup_configs
+	install_package
+	check_package_files
 
-    echo
-    echo "=== DONE ==="
-    echo "SSTP tunnel configured. Allowed from SSTP only: SSH 22, HTTP 80, ping."
-    if [ "$ENABLE_SERVER_FILE_ROUTE" = "1" ]; then
-        echo "Server-side file route enabled: $SERVER_LAN_CIDR via SSTP, file server $SERVER_FILE_IP:$SERVER_FILE_PORT."
-        echo "Test from router: wget -O - http://$SERVER_FILE_IP:$SERVER_FILE_PORT/"
-    fi
-    echo "Check status with: sh $SCRIPT_NAME status"
-    echo
-    status_cmd
+	stop_tunnel
+	install_proto_files
+	install_hotplug
+
+	purge_sections
+	configure_network
+	configure_firewall
+
+	rollback_arm
+	apply_config
+
+	PINNED=0
+	log_mark
+	bring_up
+	_up="$?"
+
+	if [ "$_up" = "1" ] && hit_arg_overflow; then
+		warn "pppd reported an unrecognized option: the args[20] overflow is still happening."
+		if pin_old_sstp_client; then
+			PINNED=1
+			stop_tunnel
+			log_mark
+			bring_up
+			_up="$?"
+		fi
+	fi
+
+	if [ "$_up" != "0" ]; then
+		err "The tunnel did not come up."
+		echo
+		echo "--- last SSTP/PPP log lines ---"
+		logread 2>/dev/null | grep -Ei 'sstp|pppd|chap|auth' | tail -25
+		echo "-------------------------------"
+		rollback_now
+		exit 1
+	fi
+
+	ok "Tunnel is up"
+	if verify; then
+		rollback_disarm
+		echo
+		echo "=== done ==="
+		echo "From the tunnel this router accepts only TCP 22, TCP 80 and ping."
+		echo "Server: ${SERVER}${PORT:+:$PORT}   interface: ${NET_SECTION}   protocol: ${PROTO}"
+		[ "$PINNED" = "1" ] && echo "sstp-client was pinned to ${PIN_VERSION}: an opkg upgrade will undo that."
+		echo "Status any time: sh ${SCRIPT_NAME} status"
+	else
+		err "The tunnel is up but the checks above failed."
+		rollback_now
+		exit 1
+	fi
 }
 
 status_cmd() {
-    echo "=== SSTP package ==="
-    opkg list-installed | grep '^sstp-client' || true
-    echo
+	# Soft detection: status must work even on a half-installed or unusual box.
+	if have apk && [ -d /lib/apk ]; then
+		PKG="apk"
+	elif have opkg; then
+		PKG="opkg"
+	else
+		PKG=""
+	fi
 
-    echo "=== SSTP proto handler ==="
-    ls -l /lib/netifd/proto/sstp.sh 2>/dev/null || true
-    echo
+	echo "=== package ==="
+	[ -n "$PKG" ] && echo "sstp-client: $(pkg_version) (${PKG})"
+	[ -x /usr/bin/sstpc ] && /usr/bin/sstpc --version 2>&1 | head -1
 
-    echo "=== Network config ==="
-    uci show network.$SSTP_IF 2>/dev/null | sed "s/password='.*'/password='***hidden***'/" || true
-    uci show network.$ROUTE_SECTION 2>/dev/null || true
-    echo
+	echo
+	echo "=== protocol handler ==="
+	if [ -f "$PROTO_FILE" ]; then
+		echo "${PROTO_FILE}: present"
+	else
+		echo "${PROTO_FILE}: MISSING, run install"
+	fi
+	if [ -f "$PPP_OPTS_FILE" ]; then
+		echo "${PPP_OPTS_FILE}: present"
+	else
+		echo "${PPP_OPTS_FILE}: MISSING, run install"
+	fi
+	[ -f /lib/netifd/proto/sstp.sh ] && echo "stock sstp.sh is also present (unused, untouched)"
 
-    echo "=== Firewall config ==="
-    uci show firewall.sstp 2>/dev/null || true
-    uci show firewall.allow_ssh_from_sstp 2>/dev/null || true
-    uci show firewall.allow_http_from_sstp 2>/dev/null || true
-    uci show firewall.allow_ping_from_sstp 2>/dev/null || true
-    uci show firewall.$FILE_RULE_SECTION 2>/dev/null || true
-    echo
+	echo
+	echo "=== network config ==="
+	uci show "network.${NET_SECTION}" 2>/dev/null | sed "s/password='.*'/password='***'/" || echo "not configured"
 
-    echo "=== Interface status ==="
-    ifstatus "$SSTP_IF" 2>/dev/null || true
-    echo
+	echo
+	echo "=== firewall config ==="
+	for _s in "$ZONE" allow_ssh_from_sstp allow_http_from_sstp allow_ping_from_sstp; do
+		uci show "firewall.${_s}" 2>/dev/null || true
+	done
 
-    echo "=== Routes ==="
-    ip route 2>/dev/null | grep -E 'sstp|ppp|192\.168\.|172\.16\.66\.' || true
-    FILE_IP="$(uci -q get firewall.$FILE_RULE_SECTION.dest_ip 2>/dev/null || true)"
-    if [ -n "$FILE_IP" ]; then
-        echo
-        echo "=== Route to configured file server ==="
-        ip route get "$FILE_IP" 2>/dev/null || true
-    fi
-    echo
+	echo
+	echo "=== interface ==="
+	ifstatus "$NET_SECTION" 2>/dev/null || echo "netifd does not know ${NET_SECTION}"
 
-    echo "=== Processes ==="
-    ps w | grep -E 'sstp|sstpc|pppd' | grep -v grep || true
-    echo
+	echo
+	echo "=== live rules ==="
+	if have nft; then
+		nft list table inet fw4 2>/dev/null | grep -i 'sstp' || echo "no sstp rules in the live ruleset"
+	elif have iptables-save; then
+		iptables-save 2>/dev/null | grep -i 'sstp' || echo "no sstp rules in the live ruleset"
+	fi
 
-    echo "=== Active ppp/sstp interfaces ==="
-    ip a 2>/dev/null | grep -A3 -E 'ppp|sstp' || true
-    echo
+	echo
+	echo "=== processes ==="
+	ps w 2>/dev/null | grep -E 'sstpc|pppd' | grep -v grep || echo "none"
 
-    echo "=== Recent SSTP/PPP log ==="
-    logread 2>/dev/null | grep -Ei 'sstp|ppp|pppd|chap|mschap|auth' | tail -80 || true
+	echo
+	echo "=== autostart ==="
+	[ -f "$HOTPLUG_FILE" ] && echo "${HOTPLUG_FILE}: present" || echo "${HOTPLUG_FILE}: missing"
+
+	echo
+	echo "=== recent log ==="
+	logread 2>/dev/null | grep -Ei 'sstp|pppd|chap|auth' | tail -40 || true
 }
 
 remove_cmd() {
-    need_root
-    need_openwrt
-    backup_configs
-    log "Removing SSTP config"
+	require_root
+	detect_platform
+	backup_configs
 
-    stop_sstp
+	log "Removing the tunnel configuration"
+	stop_tunnel
+	purge_sections
+	uci commit network || true
+	uci commit firewall || true
 
-    uci -q delete network.$SSTP_IF
-    uci -q delete network.$ROUTE_SECTION
+	rm -f "$HOTPLUG_FILE" "$PROTO_FILE" "$PPP_OPTS_FILE"
+	rm -rf "$STATE_DIR"
 
-    uci -q delete firewall.sstp
-    uci -q delete firewall.allow_ssh_from_sstp
-    uci -q delete firewall.allow_http_from_sstp
-    uci -q delete firewall.allow_https_from_sstp
-    uci -q delete firewall.allow_ping_from_sstp
-    uci -q delete firewall.sstp_to_lan
-    uci -q delete firewall.lan_to_sstp
-    uci -q delete firewall.$FILE_RULE_SECTION
+	# A reload is enough to drop the interface. netifd keeps the now deleted
+	# protocol handler registered until the next reboot, which is harmless, so
+	# do not restart the network and flap every interface over it.
+	/etc/init.d/firewall reload >/dev/null 2>&1 || true
+	/etc/init.d/network reload >/dev/null 2>&1 || true
 
-    uci commit network || true
-    uci commit firewall || true
-
-    rm -f "$HOTPLUG_FILE"
-
-    /etc/init.d/firewall restart 2>/dev/null || /etc/init.d/firewall reload 2>/dev/null || true
-    /etc/init.d/network restart || true
-
-    echo "SSTP config removed. Package sstp-client is left installed."
+	ok "Removed. sstp-client stays installed, backups are in ${BACKUP_DIR}."
 }
 
 case "${1:-}" in
-    install) install_cmd ;;
-    status)  status_cmd ;;
-    remove)  remove_cmd ;;
-    -h|--help|help|"") usage ;;
-    *) usage; exit 1 ;;
+	install) install_cmd ;;
+	status)  status_cmd ;;
+	remove)  remove_cmd ;;
+	-h|--help|help|"") usage ;;
+	*) usage; exit 1 ;;
 esac
