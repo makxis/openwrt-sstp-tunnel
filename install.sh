@@ -5,20 +5,34 @@
 # SSH 22, HTTP 80 and ICMP echo to the router itself. Nothing else: no forwarding
 # into the client LAN, no default route, no DNS takeover.
 #
-# Why this ships its own netifd protocol handler (sstpm):
-# sstp-client stores the pppd command line in a fixed "const char *args[20]"
-# (src/sstp-pppd.c, sstp_pppd_start). Eleven slots plus the NULL terminator are
-# taken by sstpc itself (pppd, tty, speed, user+value, file+tmpfile,
-# plugin+name+sstp-sock+socket), so only 8 pppd arguments fit. The stock
-# /lib/netifd/proto/sstp.sh passes 13 even with defaultroute/peerdns/ipv6 off,
-# which overflows the array. In 1.0.20 the clobbered stack slot happens to be
-# the local "speed" buffer, which is why pppd dies with
-# "unrecognized option <garbage>"; in 1.0.15 the same overflow lands somewhere
-# harmless, which is the only reason that version "works".
-# See https://github.com/openwrt/packages/issues/27318 (still open).
-# Our handler keeps the permanent pppd options in a file and passes 4 arguments.
-# If the tunnel still fails with that signature and opkg is available, the
-# installer falls back to pinning sstp-client 1.0.15-1 from 23.05.6.
+# sstp-client 1.0.20-r1, the build shipped by 24.10 and 25.12, fails on OpenWrt
+# in two unrelated ways. This installer fixes both causes instead of papering
+# over them with a package downgrade.
+#
+# 1. Overflowed pppd argument list, hence this script's own netifd protocol
+#    handler (sstpm). sstp-client stores the pppd command line in a fixed
+#    "const char *args[20]" (src/sstp-pppd.c, sstp_pppd_start). Eleven slots
+#    plus the NULL terminator are taken by sstpc itself (pppd, tty, speed,
+#    user+value, file+tmpfile, plugin+name+sstp-sock+socket), leaving room for
+#    8 pppd arguments. The stock /lib/netifd/proto/sstp.sh passes 13 even with
+#    defaultroute/peerdns/ipv6 off. In 1.0.20 the clobbered stack slot is the
+#    local "speed" buffer, so pppd dies with "unrecognized option <garbage>";
+#    in 1.0.15 the same overflow lands somewhere harmless, which is the only
+#    reason that version "works". openwrt/packages#27318, still open.
+#    Our handler keeps the permanent pppd options in a file and passes 4.
+#
+# 2. Missing MD4, hence libopenssl-legacy. Since 1.0.17 sstpc builds the
+#    MS-CHAPv2 password hash with
+#        EVP_MD_fetch(NULL, OSSL_DIGEST_NAME_MD4, "provider=legacy")
+#    and under OpenSSL 3 that provider is a separate package. Without it the
+#    fetch returns NULL, sstpc logs "Could not create password hash", derives no
+#    MPPE keys, and sends a bogus SSTP crypto binding. PPP authentication still
+#    succeeds, so the router log looks almost clean and only the server complains:
+#    "invalid Compound MAC", then the session is terminated.
+#
+# If the tunnel still refuses to come up and opkg is available, the installer
+# falls back to pinning sstp-client 1.0.15-1 from 23.05.6, which predates both
+# problems. Under apk there is nothing to pin: 25.12 ships the same 1.0.20-r1.
 
 set -u
 
@@ -39,14 +53,18 @@ STATE_DIR="/tmp/sstp-install"
 PIN_VERSION="1.0.15-1"
 PIN_RELEASE="23.05.6"
 
+# Shared library of the OpenSSL legacy provider, where MD4 lives under OpenSSL 3.
+MD4_MODULE="/usr/lib/ossl-modules/legacy.so"
+
 # Seconds the unattended rollback waits for the installer to confirm success.
 ROLLBACK_WAIT="600"
 # Seconds to wait for the tunnel to come up.
 UP_TIMEOUT="75"
 # KiB of available RAM required before letting opkg build its package lists.
 MIN_MEM_KB="20000"
-# KiB of free overlay space required for the package and config.
-MIN_OVERLAY_KB="400"
+# KiB of free overlay space required: sstp-client is about 120 KiB installed and
+# libopenssl-legacy another 130 KiB.
+MIN_OVERLAY_KB="600"
 
 SCRIPT_NAME="$(basename "$0")"
 
@@ -388,39 +406,92 @@ pkg_cache_clean() {
 	sync 2>/dev/null || true
 }
 
-install_package() {
-	_installed="$(pkg_version)"
-	if [ -n "$_installed" ] && [ -x /usr/bin/sstpc ]; then
-		ok "sstp-client ${_installed} already installed, not touching the repos"
-		return 0
-	fi
-
-	[ "$OVERLAY_KB" -ge "$MIN_OVERLAY_KB" ] 2>/dev/null \
-		|| die "Only ${OVERLAY_KB} KiB free on the overlay, sstp-client needs about ${MIN_OVERLAY_KB} KiB."
-
+pkg_refresh_index() {
 	case "$PKG" in
 		opkg)
 			if opkg_lists_fresh; then
 				log "Package lists are fresh, skipping opkg update"
-			else
-				[ "$MEM_KB" -ge "$MIN_MEM_KB" ] 2>/dev/null || die \
-					"Only ${MEM_KB} KiB RAM available, opkg update needs about ${MIN_MEM_KB} KiB. Reboot and retry."
-				log "opkg update"
-				opkg update >/dev/null || { pkg_cache_clean; die "opkg update failed, check the uplink."; }
+				return 0
 			fi
-			log "Installing sstp-client"
-			opkg install sstp-client >/dev/null || { pkg_cache_clean; die "Cannot install sstp-client."; }
+			[ "$MEM_KB" -ge "$MIN_MEM_KB" ] 2>/dev/null || die \
+				"Only ${MEM_KB} KiB RAM available, opkg update needs about ${MIN_MEM_KB} KiB. Reboot and retry."
+			log "opkg update"
+			opkg update >/dev/null || { pkg_cache_clean; die "opkg update failed, check the uplink."; }
 			;;
 		apk)
 			log "apk update"
 			apk update >/dev/null 2>&1 || warn "apk update failed, trying the cached index"
-			log "Installing sstp-client"
-			apk add sstp-client >/dev/null 2>&1 || { pkg_cache_clean; die "Cannot install sstp-client."; }
 			;;
 	esac
+}
 
+# Installs one package, refreshing the index at most once per run.
+pkg_install_one() {
+	[ "${INDEX_READY:-0}" = "1" ] || { pkg_refresh_index; INDEX_READY=1; }
+
+	log "Installing $1"
+	case "$PKG" in
+		opkg) opkg install "$1" >/dev/null || return 1 ;;
+		apk)  apk add "$1" >/dev/null 2>&1 || return 1 ;;
+	esac
+	return 0
+}
+
+# sstp-client 1.0.17 and later fetch MD4 explicitly from the OpenSSL legacy
+# provider to build the MS-CHAPv2 password hash:
+#
+#   EVP_MD_fetch(NULL, OSSL_DIGEST_NAME_MD4, "provider=legacy")   sstp-chap.c
+#
+# Without that provider the fetch returns NULL, sstpc logs "Could not create
+# password hash", never derives the MPPE keys, and the SSTP crypto binding it
+# sends is wrong. PPP authentication still succeeds, so the only visible symptom
+# is on the server: "invalid Compound MAC" immediately after a successful
+# MS-CHAPv2, followed by a terminated session. The 1.0.15 build used the static
+# EVP_md4() instead and needs none of this.
+needs_md4_provider() {
+	[ "$(pkg_version)" != "$PIN_VERSION" ]
+}
+
+ensure_md4_provider() {
+	needs_md4_provider || return 0
+
+	if [ -f "$MD4_MODULE" ]; then
+		ok "OpenSSL legacy provider present (MD4 for MS-CHAPv2)"
+	else
+		log "sstp-client $(pkg_version) needs MD4 from the OpenSSL legacy provider"
+		if ! pkg_install_one libopenssl-legacy; then
+			warn "Could not install libopenssl-legacy. MS-CHAPv2 will fail with"
+			warn "'Could not create password hash' and the server will report"
+			warn "'invalid Compound MAC'. The ${PIN_VERSION} fallback can still save this."
+			return 1
+		fi
+	fi
+
+	# The package activates itself through uci, but an earlier manual install may
+	# have left it disabled.
+	if [ "$(uci -q get openssl.legacy.enabled 2>/dev/null)" != "1" ]; then
+		log "Enabling the legacy provider in /etc/config/openssl"
+		uci set openssl.legacy=provider 2>/dev/null || true
+		uci set openssl.legacy.enabled=1 2>/dev/null || true
+		uci commit openssl 2>/dev/null || true
+		/etc/init.d/openssl reload >/dev/null 2>&1 || true
+	fi
+	return 0
+}
+
+install_package() {
+	_installed="$(pkg_version)"
+	if [ -n "$_installed" ] && [ -x /usr/bin/sstpc ]; then
+		ok "sstp-client ${_installed} already installed, not touching the repos"
+	else
+		[ "$OVERLAY_KB" -ge "$MIN_OVERLAY_KB" ] 2>/dev/null \
+			|| die "Only ${OVERLAY_KB} KiB free on the overlay, the packages need about ${MIN_OVERLAY_KB} KiB."
+		pkg_install_one sstp-client || { pkg_cache_clean; die "Cannot install sstp-client."; }
+		ok "Installed sstp-client $(pkg_version)"
+	fi
+
+	ensure_md4_provider || true
 	pkg_cache_clean
-	ok "Installed sstp-client $(pkg_version), package lists dropped to free RAM"
 }
 
 check_package_files() {
@@ -431,8 +502,9 @@ check_package_files() {
 	[ -x /lib/netifd/ppp-up ] || die "/lib/netifd/ppp-up missing, netifd ppp support is incomplete."
 }
 
-# Last resort for opkg systems: the 1.0.15-1 build whose stack layout survives
-# the args[20] overflow. Not possible under apk, 25.12 ships the same 1.0.20-r1.
+# Fallback for opkg systems when the current build still cannot establish the
+# tunnel: 1.0.15-1 predates both the args[20] blowup in practice and the MD4
+# provider fetch. Not possible under apk, 25.12 ships the same 1.0.20-r1.
 pin_old_sstp_client() {
 	[ "$PKG" = "opkg" ] || return 1
 
@@ -574,8 +646,11 @@ proto_sstpm_setup() {
 
 	# The ppp device shows up after sstpc and pppd have negotiated, netifd and
 	# fw4 need a nudge to attach the zone to it (same workaround as upstream).
+	# proto_set_keep matters here: /lib/netifd/ppp-up has already reported the
+	# address by now, and without keep this second update would drop it.
 	sleep 10
 	proto_init_update "$ifname" 1
+	proto_set_keep 1
 	proto_send_update "$config"
 	/etc/init.d/firewall reload >/dev/null 2>&1
 }
@@ -841,9 +916,19 @@ log_mark() {
 	[ -n "$LOG_MARK" ] || LOG_MARK="0"
 }
 
-# Did we hit the args[20] overflow? That is the one failure the version pin fixes.
+log_since_mark() {
+	logread 2>/dev/null | tail -n "+$(( ${LOG_MARK:-0} + 1 ))"
+}
+
+# Did we hit the args[20] overflow? That is one of the two defects the pin fixes.
 hit_arg_overflow() {
-	logread 2>/dev/null | tail -n "+$(( ${LOG_MARK:-0} + 1 ))" | grep -qi 'unrecognized option'
+	log_since_mark | grep -qi 'unrecognized option'
+}
+
+# The other one: no MD4, so no password hash, so a crypto binding the server
+# rejects as "invalid Compound MAC" while the router's log looks almost clean.
+hit_md4_failure() {
+	log_since_mark | grep -qi 'could not create password hash'
 }
 
 verify() {
@@ -895,6 +980,7 @@ install_cmd() {
 	check_uplink
 
 	backup_configs
+	PINNED=0
 	install_package
 	check_package_files
 
@@ -909,13 +995,21 @@ install_cmd() {
 	rollback_arm
 	apply_config
 
-	PINNED=0
 	log_mark
 	bring_up
 	_up="$?"
 
-	if [ "$_up" = "1" ] && hit_arg_overflow; then
-		warn "pppd reported an unrecognized option: the args[20] overflow is still happening."
+	# A timeout (1), unlike rejected credentials (2), can still be a package
+	# defect, so try the known good build once before giving up.
+	if [ "$_up" = "1" ] && [ "$PINNED" = "0" ] && [ "$(pkg_version)" != "$PIN_VERSION" ]; then
+		if hit_arg_overflow; then
+			warn "pppd reported an unrecognized option: the args[20] overflow is still happening."
+		elif hit_md4_failure; then
+			warn "sstpc could not hash the password: MD4 from the OpenSSL legacy provider"
+			warn "is still unavailable, so the crypto binding cannot be computed."
+		else
+			warn "No usable tunnel and no obvious cause in the log, trying sstp-client ${PIN_VERSION}."
+		fi
 		if pin_old_sstp_client; then
 			PINNED=1
 			stop_tunnel
@@ -931,6 +1025,9 @@ install_cmd() {
 		echo "--- last SSTP/PPP log lines ---"
 		logread 2>/dev/null | grep -Ei 'sstp|pppd|chap|auth' | tail -25
 		echo "-------------------------------"
+		echo "If this log looks clean, check the server side too: when the crypto"
+		echo "binding fails, the server logs 'invalid Compound MAC' right after a"
+		echo "successful MS-CHAPv2 and the router sees nothing unusual."
 		rollback_now
 		exit 1
 	fi
@@ -962,7 +1059,16 @@ status_cmd() {
 	fi
 
 	echo "=== package ==="
-	[ -n "$PKG" ] && echo "sstp-client: $(pkg_version) (${PKG})"
+	if [ -n "$PKG" ]; then
+		echo "sstp-client: $(pkg_version) (${PKG})"
+		if needs_md4_provider; then
+			if [ -f "$MD4_MODULE" ]; then
+				echo "OpenSSL legacy provider: present, enabled=$(uci -q get openssl.legacy.enabled || echo '?')"
+			else
+				echo "OpenSSL legacy provider: MISSING, this version needs MD4 from it"
+			fi
+		fi
+	fi
 	[ -x /usr/bin/sstpc ] && /usr/bin/sstpc --version 2>&1 | head -1
 
 	echo
