@@ -314,27 +314,50 @@ check_uplink() {
 	fi
 
 	_port="${PORT:-443}"
-	if have nc; then
-		log "Probing TCP ${SERVER}:${_port}"
-		# busybox nc dies with "timeout" when the peer sends nothing within -w,
-		# which is exactly what an SSTP server does while waiting for a TLS
-		# client hello. That means the connection succeeded, so treat it as such
-		# and only complain about real connect failures.
-		_out="$(nc -w 5 "$SERVER" "$_port" </dev/null 2>&1)"
+	probe_port "$_port"
+}
+
+# An SSTP server says nothing until it gets a TLS client hello, so a successful
+# probe looks like a connection that hangs. Anything that returns quickly with a
+# message is a real connect failure.
+probe_port() {
+	have nc || return 0
+	_p="$1"
+
+	# The nc in some busybox builds is the stripped one: no -w, no -z, just
+	# "nc IPADDR PORT". Feeding it flags only prints a usage text, so find out
+	# first and bound the run with timeout instead.
+	if nc -w 1 127.0.0.1 1 </dev/null 2>&1 | grep -qi '^usage'; then
+		have timeout || return 0
+		log "Probing TCP ${SERVER}:${_p}"
+		_out="$(timeout 5 nc "$SERVER" "$_p" </dev/null 2>&1)"
 		_rc="$?"
-		if [ "$_rc" = "0" ]; then
-			ok "Port ${_port} accepts connections"
-		else
-			case "$_out" in
-				*timeout*)
-					ok "Port ${_port} is open (server stays silent until the TLS handshake)"
-					;;
-				*)
-					warn "Cannot open TCP ${SERVER}:${_port}: ${_out:-exit ${_rc}}"
-					warn "Continuing, but the tunnel needs that port to be reachable."
-					;;
-			esac
-		fi
+		case "$_rc" in
+			0)         ok "Port ${_p} accepts connections" ;;
+			124|137|143) ok "Port ${_p} is open (server stays silent until the TLS handshake)" ;;
+			*)
+				warn "Cannot open TCP ${SERVER}:${_p}: ${_out:-exit ${_rc}}"
+				warn "Continuing, but the tunnel needs that port to be reachable."
+				;;
+		esac
+		return 0
+	fi
+
+	log "Probing TCP ${SERVER}:${_p}"
+	_out="$(nc -w 5 "$SERVER" "$_p" </dev/null 2>&1)"
+	_rc="$?"
+	if [ "$_rc" = "0" ]; then
+		ok "Port ${_p} accepts connections"
+	else
+		case "$_out" in
+			*timeout*)
+				ok "Port ${_p} is open (server stays silent until the TLS handshake)"
+				;;
+			*)
+				warn "Cannot open TCP ${SERVER}:${_p}: ${_out:-exit ${_rc}}"
+				warn "Continuing, but the tunnel needs that port to be reachable."
+				;;
+		esac
 	fi
 }
 
@@ -626,8 +649,10 @@ proto_sstpm_setup() {
 
 	[ -n "$log_level" ] || log_level=1
 
-	proto_init_update "$ifname" 1
-	proto_send_update "$config"
+	# No interface update before pppd here on purpose. An empty update marks the
+	# interface up seconds after ifup, long before IPCP, and anything waiting on
+	# ifstatus then sees "up": true with no address. /lib/netifd/ppp-up reports
+	# the real state once the address exists, same as the stock ppp handlers.
 
 	# Unquoted optional expansions on purpose: an empty argument would reach
 	# pppd as "" and be reported as an unrecognized option.
@@ -887,6 +912,18 @@ proto_is_live() {
 	ifstatus "$NET_SECTION" 2>/dev/null | grep -q "\"proto\": *\"${PROTO}\""
 }
 
+# The IPv4 address netifd holds for the tunnel, empty until IPCP is done and
+# /lib/netifd/ppp-up has reported it. Both the bring-up gate and verify ask for
+# it, and asking too early is the whole reason the first working tunnel was
+# rolled back as a failure.
+parse_ipv4() {
+	sed -n 's/.*"address": *"\([0-9][0-9.]*\)".*/\1/p' | head -1
+}
+
+tunnel_ipv4() {
+	ifstatus "$NET_SECTION" 2>/dev/null | parse_ipv4
+}
+
 bring_up() {
 	log "Bringing the tunnel up, waiting up to ${UP_TIMEOUT}s"
 	ifup "$NET_SECTION" >/dev/null 2>&1 || true
@@ -895,9 +932,15 @@ bring_up() {
 	while [ "$_waited" -lt "$UP_TIMEOUT" ]; do
 		_status="$(ifstatus "$NET_SECTION" 2>/dev/null)"
 		case "$_status" in
-			*'"up": true'*) return 0 ;;
 			*AUTH_FAILED*)  err "Server rejected the credentials (AUTH_FAILED)."; return 2 ;;
 			*NO_PPP_OPTIONS*) err "The handler cannot find ${PPP_OPTS_FILE}."; return 2 ;;
+		esac
+		# "up": true alone is not readiness: the address arrives with it when
+		# ppp-up reports, and a link without one is not a usable tunnel.
+		case "$_status" in
+			*'"up": true'*)
+				[ -n "$(printf '%s\n' "$_status" | parse_ipv4)" ] && return 0
+				;;
 		esac
 		sleep 3
 		_waited="$(( _waited + 3 ))"
@@ -942,7 +985,7 @@ verify() {
 		_rc=1
 	fi
 
-	_ip="$(ifstatus "$NET_SECTION" 2>/dev/null | sed -n 's/.*"address": *"\([0-9.]*\)".*/\1/p' | head -1)"
+	_ip="$(tunnel_ipv4)"
 	if [ -n "$_ip" ]; then
 		ok "Tunnel address: ${_ip}"
 	else
