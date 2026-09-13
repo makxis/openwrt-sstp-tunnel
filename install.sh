@@ -233,27 +233,67 @@ ask_params() {
 
 # --------------------------------------------------------------- preflight
 
+is_ipv4() {
+	case "$1" in
+		*[!0-9.]*) return 1 ;;
+	esac
+	echo "$1" | awk -F. 'NF != 4 { exit 1 } { for (i = 1; i <= 4; i++) if ($i == "" || $i + 0 > 255) exit 1 }'
+}
+
 resolve_host() {
+	if is_ipv4 "$1"; then
+		echo "$1"
+		return
+	fi
+
+	# resolveip comes with sstp-client, so on a first install it is usually not
+	# there yet and nslookup does the work.
 	if have resolveip; then
-		resolveip -4 -t 5 "$1" 2>/dev/null | head -3
-		return
+		_ips="$(resolveip -4 -t 5 "$1" 2>/dev/null | head -3)"
+		[ -z "$_ips" ] || { echo "$_ips"; return; }
 	fi
+
 	if have nslookup; then
-		# busybox prints answers as "Address 1: 1.2.3.4 name" and the resolver
-		# itself as "Address: 127.0.0.1:53", so take only the numbered lines.
-		nslookup "$1" 2>/dev/null | awk '/^Address +[0-9]+: / {
-			for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+(\.[0-9]+){3}$/) print $i
-		}' | head -3
-		return
+		# Two formats in the wild. busybox built with FEATURE_NSLOOKUP_BIG, which
+		# is what OpenWrt ships, prints answers as "Address: 1.2.3.4" after a
+		# "Name:" line; the older code prints "Address 1: 1.2.3.4 name". The
+		# resolver's own address appears before all of that as
+		# "Address:<tab>127.0.0.1#53", so skip everything up to the first Name:
+		# line or blank line and then take whatever looks like an IPv4.
+		_ips="$(nslookup "$1" 2>/dev/null | awk '
+			/^Name:/ { answers = 1 }
+			/^[[:space:]]*$/ { answers = 1; next }
+			!answers { next }
+			/^Address/ {
+				for (i = 1; i <= NF; i++)
+					if ($i ~ /^[0-9]+(\.[0-9]+){3}$/) print $i
+			}' | head -3)"
+		[ -z "$_ips" ] || { echo "$_ips"; return; }
 	fi
+
 	ping -4 -c 1 -w 5 "$1" 2>/dev/null | sed -n '1s/.*(\([0-9.]*\)).*/\1/p'
+}
+
+# Separate from resolve_host: tells us whether the name resolves at all, even
+# when no address could be parsed out of the output.
+host_resolves() {
+	have nslookup || return 1
+	nslookup "$1" >/dev/null 2>&1
 }
 
 check_uplink() {
 	log "Checking that ${SERVER} resolves"
 	SERVER_IPS="$(resolve_host "$SERVER")"
-	[ -n "$SERVER_IPS" ] || die "Cannot resolve ${SERVER}. Fix WAN/DNS first, nothing was changed."
-	ok "Resolved to: $(echo "$SERVER_IPS" | tr '\n' ' ')"
+
+	if [ -n "$SERVER_IPS" ]; then
+		ok "Resolved to: $(echo "$SERVER_IPS" | tr '\n' ' ')"
+	elif host_resolves "$SERVER"; then
+		# The name does resolve, we just could not read an address out of the
+		# output. Never block an install over a parsing difference.
+		warn "${SERVER} resolves but its address could not be parsed, continuing."
+	else
+		die "Cannot resolve ${SERVER}. Fix WAN/DNS first, nothing was changed."
+	fi
 
 	_port="${PORT:-443}"
 	if have nc; then
@@ -374,6 +414,7 @@ check_package_files() {
 	[ -x /usr/bin/sstpc ] || die "/usr/bin/sstpc missing after install."
 	[ -f /usr/lib/sstp-pppd-plugin.so ] || warn "/usr/lib/sstp-pppd-plugin.so missing, pppd integration may fail."
 	[ -x /usr/sbin/pppd ] || die "/usr/sbin/pppd missing, install the ppp package."
+	have resolveip || die "resolveip missing, the protocol handler needs it to resolve the server."
 	[ -x /lib/netifd/ppp-up ] || die "/lib/netifd/ppp-up missing, netifd ppp support is incomplete."
 }
 
