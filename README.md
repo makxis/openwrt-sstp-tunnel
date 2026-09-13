@@ -30,6 +30,8 @@ wget -O install.sh https://raw.githubusercontent.com/makxis/openwrt-sstp-tunnel/
 sh install.sh install
 ```
 
+Вопросы задаются на терминале, поэтому вариант с `| sh` работает. Если терминала нет вообще (`ssh router 'sh install.sh install'`, cron), ответы читаются со stdin в том же порядке: сервер, логин, пароль.
+
 Установщик спросит три вещи и дальше всё делает сам:
 
 ```text

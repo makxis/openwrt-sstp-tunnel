@@ -149,9 +149,21 @@ check_resources() {
 
 # -------------------------------------------------------------------- prompts
 
+# The installer is usually piped into sh, so the answers cannot come from stdin
+# and it asks on the terminal directly. "[ -r /dev/tty ]" is not the way to find
+# out whether there is one: on OpenWrt the device node exists and is readable by
+# root even with no controlling terminal, so the test passes, every read fails,
+# and under "set -u" the script dies on an unset variable instead of falling back
+# to stdin. Opening it is the only honest check.
+tty_usable() {
+	[ -c /dev/tty ] || return 1
+	( exec < /dev/tty ) 2>/dev/null
+}
+
 read_line() {
 	_prompt="$1"
 	_default="${2:-}"
+	_value=""
 
 	if [ -n "$_default" ]; then
 		_msg="$_prompt [$_default]: "
@@ -159,13 +171,12 @@ read_line() {
 		_msg="$_prompt: "
 	fi
 
-	# The installer is usually piped into sh, so ask on the terminal directly.
-	if [ -r /dev/tty ]; then
+	if tty_usable; then
 		printf "%s" "$_msg" > /dev/tty
-		IFS= read -r _value < /dev/tty
+		IFS= read -r _value < /dev/tty || _value=""
 	else
 		printf "%s" "$_msg" >&2
-		IFS= read -r _value
+		IFS= read -r _value || _value=""
 	fi
 
 	[ -n "$_value" ] || _value="$_default"
@@ -174,17 +185,18 @@ read_line() {
 
 read_secret() {
 	_prompt="$1"
+	_value=""
 
-	if [ -r /dev/tty ]; then
+	if tty_usable; then
 		printf "%s" "$_prompt" > /dev/tty
 		stty -echo < /dev/tty 2>/dev/null || true
-		IFS= read -r _value < /dev/tty
+		IFS= read -r _value < /dev/tty || _value=""
 		stty echo < /dev/tty 2>/dev/null || true
 		printf "\n" > /dev/tty
 	else
 		printf "%s" "$_prompt" >&2
 		stty -echo 2>/dev/null || true
-		IFS= read -r _value
+		IFS= read -r _value || _value=""
 		stty echo 2>/dev/null || true
 		printf "\n" >&2
 	fi
@@ -514,6 +526,13 @@ install_package() {
 	fi
 
 	ensure_md4_provider || true
+
+	# resolveip arrives as a dependency of sstp-client and the handler cannot
+	# resolve the server without it, while check_package_files refuses to go on.
+	# This covers the case where the package was pruned from an existing install.
+	have resolveip || pkg_install_one resolveip \
+		|| warn "Cannot install resolveip, the handler will not be able to resolve the server."
+
 	pkg_cache_clean
 }
 
