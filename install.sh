@@ -78,7 +78,23 @@ MIN_MEM_KB="20000"
 # need much less, which is why this is not the full figure.
 MIN_OVERLAY_KB="900"
 
+# How to invoke this script again, for the hints it prints. Piped into sh, which
+# is the documented way to run it, $0 is just "sh" and any "sh $0 status" would
+# read as "sh sh status". In that case point at the same one-liner that fetched
+# it in the first place.
+REPO_RAW="https://raw.githubusercontent.com/makxis/openwrt-sstp-tunnel/main"
 SCRIPT_NAME="$(basename "$0")"
+case "$SCRIPT_NAME" in
+	sh|-sh|ash|-ash|dash|bash|"")
+		PIPED=1
+		SCRIPT_NAME="install.sh"
+		SELF_CMD="wget -O - ${REPO_RAW}/install.sh | sh -s"
+		;;
+	*)
+		PIPED=0
+		SELF_CMD="sh ${SCRIPT_NAME}"
+		;;
+esac
 
 # Sections this script owns, plus leftovers from older versions that used to
 # route into the server-side LAN. Listed once, purged from install and remove.
@@ -116,6 +132,14 @@ installer does not confirm success within $ROLLBACK_WAIT seconds (lost session,
 broken config, unreachable router), /etc/config/network and /etc/config/firewall
 are restored from $BACKUP_DIR and the network is restarted.
 USAGE
+
+	[ "$PIPED" = "1" ] && cat <<USAGE
+
+This copy was piped into sh, so there is no ${SCRIPT_NAME} on the router. Repeat
+the one-liner with the command you want:
+  ${SELF_CMD} status
+USAGE
+	return 0
 }
 
 # ---------------------------------------------------------------- environment
@@ -1281,7 +1305,7 @@ install_cmd() {
 		echo "From the tunnel this router accepts only TCP 22, TCP 80 and ping."
 		echo "Server: ${SERVER}${PORT:+:$PORT}   interface: ${NET_SECTION}   protocol: ${PROTO}"
 		[ "$PINNED" = "1" ] && echo "sstp-client was pinned to ${PIN_VERSION}: an opkg upgrade will undo that."
-		echo "Status any time: sh ${SCRIPT_NAME} status"
+		echo "Status any time: ${SELF_CMD} status"
 	else
 		err "The tunnel is up but the checks above failed."
 		rollback_now
