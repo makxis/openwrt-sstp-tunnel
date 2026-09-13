@@ -646,7 +646,7 @@ proto_sstpm_setup() {
 	local config="$1"
 	local ifname="sstp-$config"
 	local ip serv_addr server port username password sstp_options log_level mtu
-	local _opts _local _peer
+	local _opts _local _peer _addrs _count _try _target _state
 
 	[ -f "$PPP_OPTS" ] || {
 		echo "Missing $PPP_OPTS, reinstall openwrt-sstp-tunnel"
@@ -657,8 +657,10 @@ proto_sstpm_setup() {
 
 	json_get_vars server port username password sstp_options log_level mtu
 
-	for ip in $(resolveip -4 -t 5 "$server"); do
+	_addrs=""
+	for ip in $(resolveip -4 -t 5 "$server" | sort -u); do
 		( proto_add_host_dependency "$config" "$ip" )
+		_addrs="${_addrs}${ip} "
 		serv_addr=1
 	done
 	[ -n "$serv_addr" ] || {
@@ -667,6 +669,27 @@ proto_sstpm_setup() {
 		proto_setup_failed "$config"
 		exit 1
 	}
+
+	# sstp-client resolves the server itself and only ever tries the first
+	# address: sstp_client_lookup in src/sstp-client.c takes list->ai_addr from
+	# getaddrinfo and never walks the rest of the list. Names published through a
+	# service like KeenDNS carry several A records of which only some accept 443,
+	# and the local resolver keeps handing out the same cached order for the whole
+	# TTL, so one dead address in front means netifd retries into the same timeout
+	# for as long as that lasts. Walk the addresses here instead, one per attempt,
+	# and hand sstpc the name separately: --host is what it uses for SNI, the HTTP
+	# Host header and certificate verification, which matters when the endpoint is
+	# behind a host-routed proxy. The option is missing from --help but has been in
+	# the option table since 1.0.15.
+	_count="$(echo $_addrs | wc -w)"
+	if [ "$_count" -gt 1 ]; then
+		_state="/var/run/sstpm-${config}.attempt"
+		_try="$(cat "$_state" 2>/dev/null)"
+		case "$_try" in ''|*[!0-9]*) _try=0 ;; esac
+		_target="$(echo $_addrs | cut -d' ' -f$(( _try % _count + 1 )))"
+		echo $(( (_try + 1) % _count )) > "$_state"
+		echo "Connecting to ${_target}, address $(( _try % _count + 1 )) of ${_count} for ${server}"
+	fi
 
 	[ -n "$log_level" ] || log_level=1
 
@@ -701,8 +724,9 @@ proto_sstpm_setup() {
 		--ipparam "$config" \
 		--user "$username" \
 		--password "$password" \
+		${_target:+--host "$server"} \
 		$sstp_options \
-		"$server${port:+:$port}" \
+		"${_target:-$server}${port:+:$port}" \
 		file "$_opts"
 
 	# The ppp device shows up after sstpc and pppd have negotiated, netifd and
