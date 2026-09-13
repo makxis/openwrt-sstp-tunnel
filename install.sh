@@ -298,11 +298,24 @@ check_uplink() {
 	_port="${PORT:-443}"
 	if have nc; then
 		log "Probing TCP ${SERVER}:${_port}"
-		if nc -w 5 "$SERVER" "$_port" </dev/null >/dev/null 2>&1; then
+		# busybox nc dies with "timeout" when the peer sends nothing within -w,
+		# which is exactly what an SSTP server does while waiting for a TLS
+		# client hello. That means the connection succeeded, so treat it as such
+		# and only complain about real connect failures.
+		_out="$(nc -w 5 "$SERVER" "$_port" </dev/null 2>&1)"
+		_rc="$?"
+		if [ "$_rc" = "0" ]; then
 			ok "Port ${_port} accepts connections"
 		else
-			warn "Cannot open TCP ${SERVER}:${_port}. Continuing, but the tunnel will"
-			warn "not come up if the server really is unreachable."
+			case "$_out" in
+				*timeout*)
+					ok "Port ${_port} is open (server stays silent until the TLS handshake)"
+					;;
+				*)
+					warn "Cannot open TCP ${SERVER}:${_port}: ${_out:-exit ${_rc}}"
+					warn "Continuing, but the tunnel needs that port to be reachable."
+					;;
+			esac
 		fi
 	fi
 }
@@ -646,7 +659,9 @@ purge_sections() {
 }
 
 stop_tunnel() {
-	ifdown "$NET_SECTION" 2>/dev/null || true
+	# ifdown prints "Interface <name> not found" on stdout, not stderr, so both
+	# streams go to /dev/null: before the first install there is nothing to stop.
+	ifdown "$NET_SECTION" >/dev/null 2>&1 || true
 
 	# Kill only what belongs to this tunnel: sstpc is started with
 	# "--ipparam sstp" and its pppd with "ifname sstp-sstp". A PPPoE WAN or a
@@ -798,8 +813,8 @@ proto_is_live() {
 }
 
 bring_up() {
-	log "Bringing the tunnel up"
-	ifup "$NET_SECTION" 2>/dev/null || true
+	log "Bringing the tunnel up, waiting up to ${UP_TIMEOUT}s"
+	ifup "$NET_SECTION" >/dev/null 2>&1 || true
 
 	_waited=0
 	while [ "$_waited" -lt "$UP_TIMEOUT" ]; do
@@ -811,6 +826,9 @@ bring_up() {
 		esac
 		sleep 3
 		_waited="$(( _waited + 3 ))"
+		# The handler itself waits 10s before its second interface update, so
+		# without this the installer looks frozen for over a minute.
+		[ "$(( _waited % 15 ))" = "0" ] && log "still negotiating, ${_waited}s of ${UP_TIMEOUT}s"
 	done
 	return 1
 }
