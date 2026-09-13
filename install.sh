@@ -60,7 +60,7 @@ MD4_MODULE="/usr/lib/ossl-modules/legacy.so"
 # resolver. The first entry is where podkop-style setups keep their own DNS
 # proxy; the public ones after it are what keeps the management tunnel able to
 # find its server when that stack is down, which is exactly when the tunnel is
-# needed. Answering "none" at the prompt leaves the system resolver alone.
+# needed. Answering "n" at the prompt leaves the system resolver alone.
 DEFAULT_RESOLVERS="127.0.0.10 8.8.8.8 1.1.1.1"
 RESOLVERS=""
 
@@ -261,7 +261,23 @@ ask_params() {
 	# Offer what is already configured, so a reinstall does not silently reset a
 	# list someone tuned for this router.
 	_cur_res="$(uci -q get "network.${NET_SECTION}.resolvers" || true)"
-	RESOLVERS="$(trim "$(read_line "DNS servers for the tunnel, space separated ('none' = system resolver)" "${_cur_res:-$DEFAULT_RESOLVERS}")")"
+	_def_res="${_cur_res:-$DEFAULT_RESOLVERS}"
+
+	# Asked as a confirmation rather than as a blank to fill in: the common case
+	# is pressing Enter, and a prompt that only shows a default without saying
+	# what to do with it reads like a question with no clear answer.
+	echo
+	echo "DNS servers the tunnel will use to resolve ${SERVER}:"
+	echo "  ${_def_res}"
+	_ans="$(trim "$(read_line "Enter to accept, 'n' for the system resolver, or type your own" "y")")"
+	case "$_ans" in
+		y|Y|yes|Yes|YES)              RESOLVERS="$_def_res" ;;
+		n|N|no|No|NO|none|None|NONE|-) RESOLVERS="" ;;
+		*)                            RESOLVERS="$_ans" ;;
+	esac
+
+	# Commas are as natural as spaces when typing a list of addresses.
+	RESOLVERS="$(echo "$RESOLVERS" | tr ',;' '  ' | tr -s ' ' | sed 's/^ //;s/ $//')"
 
 	validate_hostname "$SERVER" || die "Bad server name: '${SERVER}'"
 	[ -z "$PORT" ] || validate_port "$PORT" || die "Bad port: '${PORT}'"
@@ -272,9 +288,6 @@ ask_params() {
 		*[\'\"\\]*) die "Username contains quotes or backslashes, sstpc cannot take it." ;;
 	esac
 
-	case "$RESOLVERS" in
-		none|NONE|None|-) RESOLVERS="" ;;
-	esac
 	for _r in $RESOLVERS; do
 		is_ipv4 "$_r" || die "Bad DNS server address: '${_r}'"
 	done
