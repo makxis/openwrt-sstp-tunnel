@@ -392,10 +392,35 @@ check_listeners() {
 
 # ---------------------------------------------------------------- backup
 
+# Keep the last 3 pairs. These files contain the tunnel password, and on a 16 MB
+# router the older generations are not worth their space.
+prune_backups() {
+	ls -1t "$BACKUP_DIR"/network.*.bak 2>/dev/null | tail -n +4 | while read -r f; do rm -f "$f"; done
+	ls -1t "$BACKUP_DIR"/firewall.*.bak 2>/dev/null | tail -n +4 | while read -r f; do rm -f "$f"; done
+}
+
 backup_configs() {
 	umask 077
 	mkdir -p "$BACKUP_DIR" || die "Cannot create ${BACKUP_DIR}"
 	chmod 700 "$BACKUP_DIR"
+
+	# Reinstalls and repeated runs are the normal way this script is used, and
+	# each one used to leave another identical pair on the overlay. Flash is the
+	# scarce resource on a router, not RAM, so reuse the newest backup when
+	# nothing has changed since it was taken. Rollback is unaffected: the file it
+	# would restore holds exactly the same bytes.
+	_prev_net="$(ls -1t "$BACKUP_DIR"/network.*.bak 2>/dev/null | head -1)"
+	_prev_fw="$(ls -1t "$BACKUP_DIR"/firewall.*.bak 2>/dev/null | head -1)"
+	if have cmp && [ -n "$_prev_net" ] && [ -n "$_prev_fw" ] &&
+		cmp -s /etc/config/network "$_prev_net" &&
+		cmp -s /etc/config/firewall "$_prev_fw"; then
+		NET_BAK="$_prev_net"
+		FW_BAK="$_prev_fw"
+		prune_backups
+		umask 022
+		ok "Configs unchanged, reusing backups: ${NET_BAK}, ${FW_BAK}"
+		return 0
+	fi
 
 	TS="$(date +%F-%H%M%S)"
 	NET_BAK="${BACKUP_DIR}/network.${TS}.bak"
@@ -404,9 +429,7 @@ backup_configs() {
 	cp /etc/config/network "$NET_BAK" || die "Cannot back up /etc/config/network"
 	cp /etc/config/firewall "$FW_BAK" || die "Cannot back up /etc/config/firewall"
 
-	# Keep the last 10 pairs, these files contain the tunnel password.
-	ls -1t "$BACKUP_DIR"/network.*.bak 2>/dev/null | tail -n +11 | while read -r f; do rm -f "$f"; done
-	ls -1t "$BACKUP_DIR"/firewall.*.bak 2>/dev/null | tail -n +11 | while read -r f; do rm -f "$f"; done
+	prune_backups
 
 	umask 022
 	ok "Backups: ${NET_BAK}, ${FW_BAK}"
