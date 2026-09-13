@@ -62,9 +62,13 @@ ROLLBACK_WAIT="600"
 UP_TIMEOUT="75"
 # KiB of available RAM required before letting opkg build its package lists.
 MIN_MEM_KB="20000"
-# KiB of free overlay space required: sstp-client is about 120 KiB installed and
-# libopenssl-legacy another 130 KiB.
-MIN_OVERLAY_KB="600"
+# KiB of free overlay space required. Measured on a bare 24.10.3 where none of
+# it was present: sstp-client 273, libevent2-7 260, libopenssl-legacy 133,
+# resolveip 64, libopenssl-conf 19, plus opkg's own control files. The overlay
+# grew by 988 KiB in total, so the old 600 would have let an install start that
+# could not finish. Routers that already carry libevent2 and the openssl bits
+# need much less, which is why this is not the full figure.
+MIN_OVERLAY_KB="900"
 
 SCRIPT_NAME="$(basename "$0")"
 
