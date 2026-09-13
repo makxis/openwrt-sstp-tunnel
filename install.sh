@@ -723,6 +723,11 @@ EOF
 
 PPP_OPTS="/etc/ppp/options.sstpm"
 
+# Attempts that stay quick, long enough to walk the server's addresses, before
+# the handler settles to one attempt every RETRY_PACE seconds.
+FAST_TRIES=3
+RETRY_PACE=60
+
 [ -n "$INCLUDE_ONLY" ] || {
 	. /lib/functions.sh
 	. ../netifd-proto.sh
@@ -791,6 +796,7 @@ proto_sstpm_setup() {
 	local ip serv_addr server port username password sstp_options log_level mtu
 	local resolvers
 	local _opts _local _peer _addrs _count _try _target _state
+	local _fail_file _fails _last _now _wait
 
 	[ -f "$PPP_OPTS" ] || {
 		echo "Missing $PPP_OPTS, reinstall openwrt-sstp-tunnel"
@@ -800,6 +806,30 @@ proto_sstpm_setup() {
 	}
 
 	json_get_vars server port username password sstp_options resolvers log_level mtu
+
+	# Pace the retries. netifd comes straight back after a failed attempt, so an
+	# unreachable server would otherwise mean a connect attempt every ten seconds
+	# for as long as the outage lasts, and a server that goes down now and then is
+	# a normal thing to live with. The first few tries stay quick, because that is
+	# how the handler walks the server's addresses and finds the one that answers;
+	# after that it settles to one attempt a minute and leaves the router alone.
+	_fail_file="/var/run/sstpm-${config}.fails"
+	_fails="$(cat "$_fail_file" 2>/dev/null)"
+	case "$_fails" in ''|*[!0-9]*) _fails=0 ;; esac
+	_now="$(cut -d. -f1 /proc/uptime)"
+
+	if [ "$_fails" -ge "$FAST_TRIES" ]; then
+		_last="$(cat "/var/run/sstpm-${config}.last" 2>/dev/null)"
+		case "$_last" in ''|*[!0-9]*) _last=0 ;; esac
+		_wait=$(( RETRY_PACE - (_now - _last) ))
+		if [ "$_wait" -gt 0 ] && [ "$_wait" -le "$RETRY_PACE" ]; then
+			[ "$_fails" = "$FAST_TRIES" ] && echo "Server unreachable so far, backing off to one attempt every ${RETRY_PACE}s"
+			sleep "$_wait"
+		fi
+	fi
+
+	echo "$(( _fails + 1 ))" > "$_fail_file"
+	cut -d. -f1 /proc/uptime > "/var/run/sstpm-${config}.last"
 
 	_addrs=""
 	for ip in $(sstpm_resolve "$server" "$resolvers" | sort -u); do
@@ -878,17 +908,28 @@ proto_sstpm_setup() {
 	# proto_set_keep matters here: ppp-up has already reported the address by
 	# now, and without keep this second update would drop it.
 	sleep 10
+
 	_local="$(ip -4 -o addr show dev "$ifname" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)"
 	_peer="$(ip -4 -o addr show dev "$ifname" 2>/dev/null | sed -n 's/.*peer \([0-9.]*\).*/\1/p' | head -1)"
+
+	# Nothing came up, so there is nothing to attach the firewall zone to. This
+	# is the ordinary state while the server is down, and it must stay cheap: a
+	# fw4 reload on every retry would mean rebuilding the whole ruleset every few
+	# seconds for as long as the outage lasts.
+	[ -n "$_local" ] || return 0
+
 	proto_init_update "$ifname" 1
 	proto_set_keep 1
 	# Same address ppp-up reported, repeated from the device itself: netifd
 	# dedupes it, and an interface that is up with no address stays impossible
 	# even if the ip-up hook never runs. No default route and no DNS on purpose,
 	# this is a management tunnel.
-	[ -n "$_local" ] && proto_add_ipv4_address "$_local" 32 "" "$_peer"
+	proto_add_ipv4_address "$_local" 32 "" "$_peer"
 	proto_send_update "$config"
 	/etc/init.d/firewall reload >/dev/null 2>&1
+
+	# Connected: the next outage starts counting from scratch.
+	rm -f "$_fail_file"
 }
 
 proto_sstpm_teardown() {
@@ -946,6 +987,9 @@ echo "\$NOW" > "\$LOCK"
 	esac
 
 	logger -t sstp-tunnel "tunnel down after \$INTERFACE came up, restarting it once"
+	# The uplink just changed, so the handler's back-off counter is stale: an
+	# attempt now has a reason to succeed where the previous ones did not.
+	rm -f /var/run/sstpm-${NET_SECTION}.fails
 	ifdown ${NET_SECTION} 2>/dev/null
 	sleep 3
 	ifup ${NET_SECTION} 2>/dev/null
@@ -1196,6 +1240,13 @@ hit_md4_failure() {
 	log_since_mark | grep -qi 'could not create password hash'
 }
 
+# Neither of the above: the server simply did not answer. Nothing about this
+# router is wrong, so neither the version pin nor the rollback has any business
+# running, and the configuration should stay in place for netifd to retry.
+hit_server_unreachable() {
+	log_since_mark | grep -qiE 'connect timed out|could not complete connect|could not resolve'
+}
+
 verify() {
 	_rc=0
 
@@ -1264,9 +1315,16 @@ install_cmd() {
 	bring_up
 	_up="$?"
 
+	# A server that is simply down looks exactly like a timeout. Installing is
+	# something you do while the server works, so this stays a plain failure with
+	# a rollback; it only means the version pin has nothing to fix here and must
+	# not downgrade a package over someone else's outage.
+	UNREACHABLE=0
+	[ "$_up" = "1" ] && hit_server_unreachable && UNREACHABLE=1
+
 	# A timeout (1), unlike rejected credentials (2), can still be a package
 	# defect, so try the known good build once before giving up.
-	if [ "$_up" = "1" ] && [ "$PINNED" = "0" ] && [ "$(pkg_version)" != "$PIN_VERSION" ]; then
+	if [ "$_up" = "1" ] && [ "$UNREACHABLE" = "0" ] && [ "$PINNED" = "0" ] && [ "$(pkg_version)" != "$PIN_VERSION" ]; then
 		if hit_arg_overflow; then
 			warn "pppd reported an unrecognized option: the args[20] overflow is still happening."
 		elif hit_md4_failure; then
@@ -1290,9 +1348,15 @@ install_cmd() {
 		echo "--- last SSTP/PPP log lines ---"
 		logread 2>/dev/null | grep -Ei 'sstp|pppd|chap|auth' | tail -25
 		echo "-------------------------------"
-		echo "If this log looks clean, check the server side too: when the crypto"
-		echo "binding fails, the server logs 'invalid Compound MAC' right after a"
-		echo "successful MS-CHAPv2 and the router sees nothing unusual."
+		if [ "$UNREACHABLE" = "1" ]; then
+			echo "${SERVER}${PORT:+:$PORT} never answered. That points at the server"
+			echo "side rather than at this router: check that it is up and reachable,"
+			echo "then run the installer again."
+		else
+			echo "If this log looks clean, check the server side too: when the crypto"
+			echo "binding fails, the server logs 'invalid Compound MAC' right after a"
+			echo "successful MS-CHAPv2 and the router sees nothing unusual."
+		fi
 		rollback_now
 		exit 1
 	fi
