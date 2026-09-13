@@ -18,17 +18,27 @@ OpenWrt-роутер клиента:  22, 80, ping
 
 ## Установка
 
+Рекомендуемый способ — сохранить скрипт на роутер: тогда `status` и `remove` потом работают одной короткой командой. Команды разбиты, чтобы не упирались в ограничение на длину вставки в консоли роутера.
+
+```sh
+U=https://raw.githubusercontent.com/makxis/openwrt-sstp-tunnel/main/install.sh
+```
+
+```sh
+wget -O /root/install.sh $U
+```
+
+```sh
+sh /root/install.sh install
+```
+
+Можно и одной строкой, без сохранения файла:
+
 ```sh
 wget -O - https://raw.githubusercontent.com/makxis/openwrt-sstp-tunnel/main/install.sh | sh -s install
 ```
 
-Или файлом, если нужно оставить скрипт на роутере:
-
-```sh
-cd /root
-wget -O install.sh https://raw.githubusercontent.com/makxis/openwrt-sstp-tunnel/main/install.sh
-sh install.sh install
-```
+Но тогда на роутере не остаётся `/root/install.sh`, и для `status` или `remove` скрипт придётся скачать заново — см. соответствующие разделы.
 
 Вопросы задаются на терминале, поэтому вариант с `| sh` работает. Если терминала нет вообще (`ssh router 'sh install.sh install'`, cron), ответы читаются со stdin в том же порядке: сервер, логин, пароль, DNS.
 
@@ -223,7 +233,7 @@ output  REJECT
 sh /root/install.sh status
 ```
 
-Без сохранения файла на роутере:
+Если ставили одной строкой, файла на роутере нет. Тогда либо скачать его (см. [Установка](#установка)), либо запустить так же одной строкой:
 
 ```sh
 wget -O - https://raw.githubusercontent.com/makxis/openwrt-sstp-tunnel/main/install.sh | sh -s status
@@ -236,6 +246,14 @@ wget -O - https://raw.githubusercontent.com/makxis/openwrt-sstp-tunnel/main/inst
 ```sh
 sh /root/install.sh remove
 ```
+
+Если `/root/install.sh` нет, потому что установка шла одной строкой, — то же самое без сохранения файла:
+
+```sh
+wget -O - https://raw.githubusercontent.com/makxis/openwrt-sstp-tunnel/main/install.sh | sh -s remove
+```
+
+Ставить заново после удаления не обязательно: повторная установка поверх перезаписывает обработчик и конфигурацию сама. Удаление нужно, только если хочется начать с чистого листа.
 
 Убираются интерфейс `network.sstp`, зона и правила, обработчик `sstpm.sh`, файл опций pppd, hotplug, а также секции от старых версий скрипта, включая маршрут к серверной LAN и правило доступа к файловому серверу, если они остались. Пакет `sstp-client` остаётся установленным, бэкапы остаются в `/root/sstp-backup`.
 
