@@ -56,6 +56,14 @@ PIN_RELEASE="23.05.6"
 # Shared library of the OpenSSL legacy provider, where MD4 lives under OpenSSL 3.
 MD4_MODULE="/usr/lib/ossl-modules/legacy.so"
 
+# DNS servers the tunnel resolves its endpoint through, ahead of the system
+# resolver. The first entry is where podkop-style setups keep their own DNS
+# proxy; the public ones after it are what keeps the management tunnel able to
+# find its server when that stack is down, which is exactly when the tunnel is
+# needed. Answering "none" at the prompt leaves the system resolver alone.
+DEFAULT_RESOLVERS="127.0.0.10 8.8.8.8 1.1.1.1"
+RESOLVERS=""
+
 # Seconds the unattended rollback waits for the installer to confirm success.
 ROLLBACK_WAIT="600"
 # Seconds to wait for the tunnel to come up.
@@ -250,6 +258,10 @@ ask_params() {
 	parse_server "$(read_line "SSTP server (host or host:port)" "")"
 	USERNAME="$(trim "$(read_line "Username" "")")"
 	PASSWORD="$(read_secret "Password: ")"
+	# Offer what is already configured, so a reinstall does not silently reset a
+	# list someone tuned for this router.
+	_cur_res="$(uci -q get "network.${NET_SECTION}.resolvers" || true)"
+	RESOLVERS="$(trim "$(read_line "DNS servers for the tunnel, space separated ('none' = system resolver)" "${_cur_res:-$DEFAULT_RESOLVERS}")")"
 
 	validate_hostname "$SERVER" || die "Bad server name: '${SERVER}'"
 	[ -z "$PORT" ] || validate_port "$PORT" || die "Bad port: '${PORT}'"
@@ -260,9 +272,21 @@ ask_params() {
 		*[\'\"\\]*) die "Username contains quotes or backslashes, sstpc cannot take it." ;;
 	esac
 
+	case "$RESOLVERS" in
+		none|NONE|None|-) RESOLVERS="" ;;
+	esac
+	for _r in $RESOLVERS; do
+		is_ipv4 "$_r" || die "Bad DNS server address: '${_r}'"
+	done
+
 	echo
 	log "Server: ${SERVER}${PORT:+:$PORT}"
 	log "Username: ${USERNAME}"
+	if [ -n "$RESOLVERS" ]; then
+		log "DNS for the tunnel: ${RESOLVERS}, then the system resolver"
+	else
+		log "DNS for the tunnel: system resolver"
+	fi
 }
 
 # --------------------------------------------------------------- preflight
@@ -274,11 +298,37 @@ is_ipv4() {
 	echo "$1" | awk -F. 'NF != 4 { exit 1 } { for (i = 1; i <= 4; i++) if ($i == "" || $i + 0 > 255) exit 1 }'
 }
 
+# Ask nslookup, optionally against a specific server, and print the IPv4
+# answers. Two formats are in the wild: busybox built with FEATURE_NSLOOKUP_BIG,
+# which is what OpenWrt ships, prints answers as "Address: 1.2.3.4" after a
+# "Name:" line, while the older code prints "Address 1: 1.2.3.4 name". Either
+# way the resolver's own address comes first, as "Address:<tab>127.0.0.1#53", so
+# skip to the first answer marker before reading anything.
+nslookup_ips() {
+	have nslookup || return 0
+	nslookup "$1" ${2:+"$2"} 2>/dev/null | awk '
+		/^Name:/ { answers = 1 }
+		/^[[:space:]]*$/ { answers = 1; next }
+		!answers { next }
+		/^Address/ {
+			for (i = 1; i <= NF; i++)
+				if ($i ~ /^[0-9]+(\.[0-9]+){3}$/) print $i
+		}' | head -3
+}
+
 resolve_host() {
 	if is_ipv4 "$1"; then
 		echo "$1"
 		return
 	fi
+
+	# The servers the tunnel itself will use come first, so an install run while
+	# the local resolver is down behaves the way the tunnel will, and the check
+	# does not pass on a resolver the tunnel is never going to ask.
+	for _r in ${RESOLVERS:-}; do
+		_ips="$(nslookup_ips "$1" "$_r")"
+		[ -z "$_ips" ] || { echo "$_ips"; return; }
+	done
 
 	# resolveip comes with sstp-client, so on a first install it is usually not
 	# there yet and nslookup does the work.
@@ -287,23 +337,8 @@ resolve_host() {
 		[ -z "$_ips" ] || { echo "$_ips"; return; }
 	fi
 
-	if have nslookup; then
-		# Two formats in the wild. busybox built with FEATURE_NSLOOKUP_BIG, which
-		# is what OpenWrt ships, prints answers as "Address: 1.2.3.4" after a
-		# "Name:" line; the older code prints "Address 1: 1.2.3.4 name". The
-		# resolver's own address appears before all of that as
-		# "Address:<tab>127.0.0.1#53", so skip everything up to the first Name:
-		# line or blank line and then take whatever looks like an IPv4.
-		_ips="$(nslookup "$1" 2>/dev/null | awk '
-			/^Name:/ { answers = 1 }
-			/^[[:space:]]*$/ { answers = 1; next }
-			!answers { next }
-			/^Address/ {
-				for (i = 1; i <= NF; i++)
-					if ($i ~ /^[0-9]+(\.[0-9]+){3}$/) print $i
-			}' | head -3)"
-		[ -z "$_ips" ] || { echo "$_ips"; return; }
-	fi
+	_ips="$(nslookup_ips "$1")"
+	[ -z "$_ips" ] || { echo "$_ips"; return; }
 
 	ping -4 -c 1 -w 5 "$1" 2>/dev/null | sed -n '1s/.*(\([0-9.]*\)).*/\1/p'
 }
@@ -663,16 +698,61 @@ proto_sstpm_init_config() {
 	proto_config_add_string "username"
 	proto_config_add_string "password"
 	proto_config_add_string "sstp_options"
+	proto_config_add_string "resolvers"
 	proto_config_add_int "log_level"
 	proto_config_add_int "mtu"
 	available=1
 	no_device=1
 }
 
+# Parse IPv4 answers out of nslookup, optionally against a given server. Two
+# busybox formats are in the wild: "Address: 1.2.3.4" under a "Name:" line, and
+# the older "Address 1: 1.2.3.4 name". Either way the resolver's own address is
+# printed first, so skip to the first answer marker before reading anything.
+sstpm_lookup() {
+	nslookup "$1" ${2:+"$2"} 2>/dev/null | awk '
+		/^Name:/ { answers = 1 }
+		/^[[:space:]]*$/ { answers = 1; next }
+		!answers { next }
+		/^Address/ {
+			for (i = 1; i <= NF; i++)
+				if ($i ~ /^[0-9]+(\.[0-9]+){3}$/) print $i
+		}'
+}
+
+# Resolve through the servers listed in the interface's "resolvers" option, in
+# order, and fall back to the system resolver when none of them answers. This is
+# the difference between a management tunnel that survives a broken resolver and
+# one that does not: on a router where something like podkop owns DNS, that
+# something going down takes the system resolver with it, and a tunnel that
+# cannot resolve its server is a tunnel that cannot be used to go fix the router.
+# Nothing here touches /etc/resolv.conf or dnsmasq, so the rest of the box keeps
+# resolving exactly as it did.
+#
+# A server that refuses the connection costs nothing, one that black-holes it
+# costs five seconds before nslookup gives up, which is why the local resolver
+# belongs first in the list and public ones after it.
+sstpm_resolve() {
+	local host="$1"
+	local servers="$2"
+	local s ips
+
+	for s in $servers; do
+		ips="$(sstpm_lookup "$host" "$s")"
+		[ -n "$ips" ] && { echo "$ips"; return 0; }
+	done
+
+	ips="$(resolveip -4 -t 5 "$host" 2>/dev/null)"
+	[ -n "$ips" ] && { echo "$ips"; return 0; }
+
+	sstpm_lookup "$host"
+}
+
 proto_sstpm_setup() {
 	local config="$1"
 	local ifname="sstp-$config"
 	local ip serv_addr server port username password sstp_options log_level mtu
+	local resolvers
 	local _opts _local _peer _addrs _count _try _target _state
 
 	[ -f "$PPP_OPTS" ] || {
@@ -682,10 +762,10 @@ proto_sstpm_setup() {
 		exit 1
 	}
 
-	json_get_vars server port username password sstp_options log_level mtu
+	json_get_vars server port username password sstp_options resolvers log_level mtu
 
 	_addrs=""
-	for ip in $(resolveip -4 -t 5 "$server" | sort -u); do
+	for ip in $(sstpm_resolve "$server" "$resolvers" | sort -u); do
 		( proto_add_host_dependency "$config" "$ip" )
 		_addrs="${_addrs}${ip} "
 		serv_addr=1
@@ -881,6 +961,11 @@ configure_network() {
 	uci set "network.${NET_SECTION}.username=${USERNAME}"
 	uci set "network.${NET_SECTION}.password=${PASSWORD}"
 	uci set "network.${NET_SECTION}.sstp_options=--tls-ext"
+	if [ -n "$RESOLVERS" ]; then
+		uci set "network.${NET_SECTION}.resolvers=${RESOLVERS}"
+	else
+		uci -q delete "network.${NET_SECTION}.resolvers" || true
+	fi
 	# Read by netifd itself, not by the handler. /lib/netifd/ppp-up offers a
 	# default route through the peer and the server's DNS; a management tunnel
 	# must not take over the routing table or resolution of the whole router.
@@ -1231,6 +1316,28 @@ status_cmd() {
 	echo
 	echo "=== network config ==="
 	uci show "network.${NET_SECTION}" 2>/dev/null | sed "s/password='.*'/password='***'/" || echo "not configured"
+
+	echo
+	echo "=== dns ==="
+	_srv="$(uci -q get "network.${NET_SECTION}.server" || true)"
+	_res="$(uci -q get "network.${NET_SECTION}.resolvers" || true)"
+	if [ -z "$_res" ]; then
+		echo "resolvers: not set, the system resolver is used"
+	else
+		for _r in $_res; do
+			if [ -n "$_srv" ]; then
+				_a="$(nslookup_ips "$_srv" "$_r")"
+				if [ -n "$_a" ]; then
+					echo "${_r}: $(echo $_a | tr '\n' ' ')"
+				else
+					echo "${_r}: no answer"
+				fi
+			else
+				echo "${_r}: configured"
+			fi
+		done
+	fi
+	[ -z "$_srv" ] || echo "system resolver: $(nslookup_ips "$_srv" | tr '\n' ' ' | sed 's/ $//')"
 
 	echo
 	echo "=== firewall config ==="
