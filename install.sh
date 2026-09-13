@@ -19,7 +19,7 @@
 #    local "speed" buffer, so pppd dies with "unrecognized option <garbage>";
 #    in 1.0.15 the same overflow lands somewhere harmless, which is the only
 #    reason that version "works". openwrt/packages#27318, still open.
-#    Our handler keeps the permanent pppd options in a file and passes 4.
+#    Our handler keeps every pppd option in files and passes 2.
 #
 # 2. Missing MD4, hence libopenssl-legacy. Since 1.0.17 sstpc builds the
 #    MS-CHAPv2 password hash with
@@ -597,8 +597,9 @@ EOF
 # by sstpc itself). The overflow corrupts sstpc's stack and pppd then dies with
 # "unrecognized option <garbage>". See openwrt/packages#27318.
 #
-# Permanent pppd options are in /etc/ppp/options.sstpm, so this passes 4
-# arguments (8 with mtu set), which fits.
+# Permanent pppd options are in /etc/ppp/options.sstpm and the per-interface
+# ones in a generated /var/etc/sstpm-<config>.options, so this passes 2
+# arguments no matter what is configured, which fits.
 
 [ -x /usr/bin/sstpc ] || exit 0
 
@@ -626,6 +627,7 @@ proto_sstpm_setup() {
 	local config="$1"
 	local ifname="sstp-$config"
 	local ip serv_addr server port username password sstp_options log_level mtu
+	local _opts _local _peer
 
 	[ -f "$PPP_OPTS" ] || {
 		echo "Missing $PPP_OPTS, reinstall openwrt-sstp-tunnel"
@@ -654,6 +656,23 @@ proto_sstpm_setup() {
 	# ifstatus then sees "up": true with no address. /lib/netifd/ppp-up reports
 	# the real state once the address exists, same as the stock ppp handlers.
 
+	# Everything that varies per interface goes into a generated options file
+	# instead of the command line. pppd gets "ipparam" that way, which is what
+	# /lib/netifd/ppp-up reads out of its sixth argument to know which netifd
+	# interface to report to. sstpc accepts --ipparam but keeps it to itself: it
+	# never reaches pppd (src/sstp-pppd.c builds the argv without it), so with
+	# the stock handler ppp-up calls proto_send_update with an empty name and
+	# netifd never learns the address. This also keeps the pppd argument count
+	# at 2 of the 8 sstpc can forward, mtu or no mtu.
+	mkdir -p /var/etc
+	_opts="/var/etc/sstpm-${config}.options"
+	{
+		echo "file $PPP_OPTS"
+		echo "ifname $ifname"
+		echo "ipparam $config"
+		[ -n "$mtu" ] && echo "mtu $mtu" && echo "mru $mtu"
+	} > "$_opts"
+
 	# Unquoted optional expansions on purpose: an empty argument would reach
 	# pppd as "" and be reported as an unrecognized option.
 	proto_run_command "$config" /usr/bin/sstpc \
@@ -665,17 +684,22 @@ proto_sstpm_setup() {
 		--password "$password" \
 		$sstp_options \
 		"$server${port:+:$port}" \
-		file "$PPP_OPTS" \
-		ifname "$ifname" \
-		${mtu:+mtu $mtu mru $mtu}
+		file "$_opts"
 
 	# The ppp device shows up after sstpc and pppd have negotiated, netifd and
 	# fw4 need a nudge to attach the zone to it (same workaround as upstream).
-	# proto_set_keep matters here: /lib/netifd/ppp-up has already reported the
-	# address by now, and without keep this second update would drop it.
+	# proto_set_keep matters here: ppp-up has already reported the address by
+	# now, and without keep this second update would drop it.
 	sleep 10
+	_local="$(ip -4 -o addr show dev "$ifname" 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)"
+	_peer="$(ip -4 -o addr show dev "$ifname" 2>/dev/null | sed -n 's/.*peer \([0-9.]*\).*/\1/p' | head -1)"
 	proto_init_update "$ifname" 1
 	proto_set_keep 1
+	# Same address ppp-up reported, repeated from the device itself: netifd
+	# dedupes it, and an interface that is up with no address stays impossible
+	# even if the ip-up hook never runs. No default route and no DNS on purpose,
+	# this is a management tunnel.
+	[ -n "$_local" ] && proto_add_ipv4_address "$_local" 32 "" "$_peer"
 	proto_send_update "$config"
 	/etc/init.d/firewall reload >/dev/null 2>&1
 }
@@ -694,6 +718,7 @@ proto_sstpm_teardown() {
 		;;
 	esac
 	proto_kill_command "$config"
+	rm -f "/var/etc/sstpm-${config}.options"
 }
 
 [ -n "$INCLUDE_ONLY" ] || {
@@ -702,7 +727,7 @@ proto_sstpm_teardown() {
 EOF
 	chmod 755 "$PROTO_FILE"
 	sh -n "$PROTO_FILE" || die "Generated ${PROTO_FILE} is not valid shell."
-	ok "Handler installed, pppd argument count: 4 of 8 allowed"
+	ok "Handler installed, pppd argument count: 2 of 8 allowed"
 }
 
 install_hotplug() {
@@ -786,6 +811,11 @@ configure_network() {
 	uci set "network.${NET_SECTION}.username=${USERNAME}"
 	uci set "network.${NET_SECTION}.password=${PASSWORD}"
 	uci set "network.${NET_SECTION}.sstp_options=--tls-ext"
+	# Read by netifd itself, not by the handler. /lib/netifd/ppp-up offers a
+	# default route through the peer and the server's DNS; a management tunnel
+	# must not take over the routing table or resolution of the whole router.
+	uci set "network.${NET_SECTION}.defaultroute=0"
+	uci set "network.${NET_SECTION}.peerdns=0"
 	uci set "network.${NET_SECTION}.log_level=1"
 	uci set "network.${NET_SECTION}.auto=1"
 }
